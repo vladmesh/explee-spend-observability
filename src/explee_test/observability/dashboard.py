@@ -50,6 +50,9 @@ def _is_primary(definition: ProviderDefinition, labels_json: str) -> bool:
 
 RATE_LAG_SECONDS = 600.0
 RATE_WINDOW_POINTS = 121
+# The rate is a speedometer: it always reads the most recent samples, whatever range
+# the reader has selected. Two hours is comfortably more than RATE_WINDOW_POINTS polls.
+RATE_LOOKBACK_HOURS = 2.0
 
 
 def _despike(points: list[tuple[str, float]]) -> list[tuple[str, float]]:
@@ -374,6 +377,18 @@ def build_overview(
             SELECT * FROM ranked WHERE rank = 1
             """
         ).fetchall()
+        # Rates, forecasts and the burn headline answer "right now", so they read the
+        # latest samples regardless of the selected range; a click that narrows the
+        # window to five minutes must not turn them into five minutes of noise.
+        rate_rows = connection.execute(
+            """
+            SELECT provider, observed_at, value, labels_json
+            FROM observations
+            WHERE observed_at >= ? AND observed_at <= ?
+            ORDER BY observed_at
+            """,
+            ((now - timedelta(hours=RATE_LOOKBACK_HOURS)).isoformat(), now.isoformat()),
+        ).fetchall()
         streak_rows = connection.execute(
             """
             SELECT r.provider, r.requested_at, p.outcome
@@ -405,6 +420,10 @@ def build_overview(
         definition = PROVIDERS[row["provider"]]
         if _is_primary(definition, row["labels_json"]):
             history[row["provider"]].append(row)
+    recent: dict[str, list[tuple[str, float]]] = defaultdict(list)
+    for row in rate_rows:
+        if _is_primary(PROVIDERS[row["provider"]], row["labels_json"]):
+            recent[row["provider"]].append((row["observed_at"], row["value"]))
     latest_attempt = {row["provider"]: row for row in latest_attempt_rows}
     latest_observation = {}
     for row in latest_observation_rows:
@@ -456,12 +475,20 @@ def build_overview(
         ]
         value = latest["value"] if latest else None
         window_hours = _window_hours(latest["labels_json"]) if latest else None
+        rate_points = recent[provider]
         if definition.pay_model == "spend_report":
-            rate = _spend_per_hour(points, window_hours)
-            window_delta_per_hour = _rate_per_hour(points)
+            rate = _spend_per_hour(rate_points, window_hours)
+            window_delta_per_hour = _rate_per_hour(rate_points)
         else:
-            rate = _rate_per_hour(points)
+            rate = _rate_per_hour(rate_points)
             window_delta_per_hour = None
+        # A spend report has no balance to lose, so its window spend is the rate
+        # over the hours the series actually covers, never over hours with no data.
+        series_hours = (
+            (_parse_time(points[-1][0]) - _parse_time(points[0][0])).total_seconds() / 3600
+            if len(points) > 1
+            else 0.0
+        )
         forecast = (
             _forecast(definition, value, rate, latest["refresh_at"], now) if latest else None
         )
@@ -503,9 +530,9 @@ def build_overview(
                     else _relative_rate(rate, value)
                 ),
                 "sparkline": _sparkline(points),
-                "rate_window_minutes": _rate_window_minutes(points),
+                "rate_window_minutes": _rate_window_minutes(rate_points),
                 "window_spend": (
-                    round(abs(rate) * span_hours, 4)
+                    round(abs(rate) * min(span_hours, series_hours), 4)
                     if definition.pay_model == "spend_report" and rate
                     else round(abs(_window_outflow(points)), 4)
                 ),

@@ -102,6 +102,12 @@ implied thirty-day spend at that pace. The slope of the window itself is still e
 
 None of these are alerting thresholds or claims that the rate will persist.
 
+Rates, forecasts and the burn headline are speedometers: they always read the most recent two
+hours of samples (capped to the last 121 points), whatever range the reader has selected, so a
+click that narrows the window to five minutes cannot turn them into five minutes of noise. The
+selected range scopes attempts, trend, events and window spend. For a spend report the window
+spend is the rate over the hours the series actually covers, never over hours with no data.
+
 ## Events
 
 Levels alone force a reader to find top-ups, package resets, source glitches, and outages by eye, one
@@ -137,7 +143,9 @@ Alerts are states, not messages. Each rule declares which alerts should be open 
 store is reconciled against that: a condition that became true opens once, a condition that stopped
 being true resolves once, and nothing repeats every thirty seconds while a provider quietly runs out.
 Every alert carries the evidence that makes it checkable, and `alerts.jsonl` records both transitions
-as single-write append lines.
+as single-write append lines. Every line carries `ts` (ISO-8601 with a timezone offset) and `text`,
+the keys the task requires, plus `event` (`opened`/`resolved`), `rule`, `severity`, `provider`,
+`dedupe_key` and the evidence.
 
 | rule | severity | condition |
 | --- | --- | --- |

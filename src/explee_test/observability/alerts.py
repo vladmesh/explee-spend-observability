@@ -304,7 +304,11 @@ def collector_alerts(path: Path, now: datetime) -> list[Alert]:
 
 
 def _write_line(journal: Path, payload: dict[str, Any]) -> None:
-    """Append one alert transition as a single write, so a reader never sees half."""
+    """Append one alert transition as a single write, so a reader never sees half.
+
+    ``ts`` (ISO-8601 with offset) and ``text`` are the keys the task requires of
+    every line; ``at`` is kept as the same value for the dashboard API.
+    """
 
     journal.parent.mkdir(parents=True, exist_ok=True)
     line = json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n"
@@ -364,6 +368,7 @@ def reconcile(
             _write_line(
                 journal,
                 {
+                    "ts": stamp,
                     "at": stamp,
                     "event": "opened",
                     "rule": alert.rule,
@@ -387,6 +392,7 @@ def reconcile(
             _write_line(
                 journal,
                 {
+                    "ts": stamp,
                     "at": stamp,
                     "event": "resolved",
                     "rule": row["rule"],

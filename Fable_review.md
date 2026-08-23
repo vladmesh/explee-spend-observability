@@ -19,7 +19,7 @@
 
 ## P0 — расхождение с ТЗ или неверное число в заголовке
 
-### 1. В `alerts.jsonl` нет обязательного ключа `ts`
+### 1. [ИСПРАВЛЕНО] В `alerts.jsonl` нет обязательного ключа `ts`
 
 ТЗ: «Every alert is one JSON line. **Required keys: `ts`** — ISO-8601 with a timezone offset … and
 `text`». Реализация (`alerts.py::reconcile → _write_line`) пишет время в ключ **`at`**, ключа `ts`
@@ -33,7 +33,7 @@
 требование к формату файла в ТЗ, и оно не выполнено. Исправление — одна строка (`"ts": stamp`),
 `at` можно оставить рядом для обратной совместимости с `/api/alerts`.
 
-### 2. «Spent in the selected window» экстраполирует spend_report на весь запрошенный диапазон
+### 2. [ИСПРАВЛЕНО] «Spent in the selected window» экстраполирует spend_report на весь запрошенный диапазон
 
 `dashboard.py`, `window_spend` для `pay_model == "spend_report"` = `abs(rate) * span_hours`, где
 `span_hours` — **запрошенная** длина окна, а не покрытая данными. Сводка потом делит сумму на
@@ -53,7 +53,7 @@
 вообще не складывать экстраполяцию из spend_report с фактическим оттоком балансов, а показывать их
 раздельно с подписью «estimated».
 
-### 3. Rate, Time to zero, «Burning now», «Projected 30 days» и «Running out» пересчитываются из узкого явного окна
+### 3. [ИСПРАВЛЕНО] Rate, Time to zero, «Burning now», «Projected 30 days» и «Running out» пересчитываются из узкого явного окна
 
 `_rate_per_hour(points)` берёт точки **из выбранного окна**. При пресетах это ~121 точка ≈ 1 ч и
 подпись под таблицей («measured over the last 60 minutes … whatever range is selected») верна. Но
@@ -217,6 +217,17 @@ openai: с 11:38Z расход упал с ~$5/ч до ~$0.15/ч (шаги −0.
 архивом — не зацепить.
 
 ---
+
+## Исправлено после ревью (2026-08-23, тот же день)
+
+- П0-1: каждая строка `alerts.jsonl` несёт `ts` (= `at`, ISO-8601 с offset) — `alerts.py::reconcile`;
+  тест `test_every_journal_line_carries_the_required_ts_and_text_keys`. Строки, записанные до
+  фикса (11:16Z–деплой фикса), ключа `ts` не имеют.
+- П0-2: `window_spend` для spend_report = rate × `min(окно, размах серии)` — `dashboard.py`;
+  тест `test_spend_report_window_spend_covers_only_the_hours_with_data`.
+- П0-3: rate / forecast / burn / rate_window_minutes читаются из последних двух часов наблюдений
+  (`RATE_LOOKBACK_HOURS`), независимо от `start/end` и пресета; окно по-прежнему скоупит attempts,
+  trend, events, window spend — тест `test_the_rate_reads_the_latest_samples_whatever_window_is_selected`.
 
 ## Что бы я сделал до сдачи, в порядке убывания цены ошибки
 

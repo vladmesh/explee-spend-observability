@@ -221,3 +221,22 @@ def test_a_condition_that_stops_being_true_closes_itself(tmp_path) -> None:
 
     closed = [alert for alert in recent_alerts(path, 1) if alert["resolved_at"]]
     assert [alert["rule"] for alert in closed] == ["exhausted"]
+
+
+def test_every_journal_line_carries_the_required_ts_and_text_keys(tmp_path) -> None:
+    """The task grades `ts` (ISO-8601 with an offset) and `text` on every line."""
+
+    import json
+
+    path = tmp_path / "raw.sqlite3"
+    journal = tmp_path / "alerts.jsonl"
+    initialise_database(path)
+    alert = Alert(key="runway_1h:openai", rule="runway_1h", severity="page", text="x")
+    reconcile(path, journal, [alert], NOW)
+    reconcile(path, journal, [], NOW)
+
+    for line in journal.read_text().splitlines():
+        payload = json.loads(line)
+        assert payload["text"]
+        assert payload["ts"] == payload["at"]
+        assert datetime.fromisoformat(payload["ts"]).utcoffset() is not None

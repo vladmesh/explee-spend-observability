@@ -438,3 +438,46 @@ def test_the_rate_window_is_reported_so_a_reader_can_see_what_it_covers(tmp_path
 
     # Nine minutes of samples cannot claim a twelve hour window.
     assert overview["summary"]["rate_window_minutes"] == 9.0
+
+
+def test_the_rate_reads_the_latest_samples_whatever_window_is_selected(tmp_path) -> None:
+    """A click that narrows the window to five past minutes must not move the speedometer."""
+
+    path = tmp_path / "raw.sqlite3"
+    initialise_database(path)
+    _load(path, "openai", [100 - minute for minute in range(30)], _balance)
+    now = datetime(2026, 8, 23, 0, 30, tzinfo=UTC)
+
+    full = build_overview(path, 1, now=now)
+    narrowed = build_overview(
+        path, 1, now=now, start="2026-08-23T00:02:00+00:00", end="2026-08-23T00:07:00+00:00"
+    )
+    pick = lambda overview: next(  # noqa: E731
+        item for item in overview["providers"] if item["provider"] == "openai"
+    )
+
+    assert narrowed["summary"]["attempts"] == 6  # the range still scopes the attempts
+    assert pick(narrowed)["rate_per_hour"] == pick(full)["rate_per_hour"] == -60.0
+    assert pick(narrowed)["forecast"] == pick(full)["forecast"]
+    assert pick(narrowed)["rate_window_minutes"] == pick(full)["rate_window_minutes"]
+    assert narrowed["summary"]["usd_burn_per_hour"] == full["summary"]["usd_burn_per_hour"]
+
+
+def test_spend_report_window_spend_covers_only_the_hours_with_data(tmp_path) -> None:
+    """A week-long range over nine minutes of data is nine minutes of spend, not a week."""
+
+    path = tmp_path / "raw.sqlite3"
+    initialise_database(path)
+    _load(
+        path,
+        "meta_ads",
+        [240.0] * 10,
+        lambda level: {"spend_usd_24h": level, "spend_usd_30d": level * 30},
+    )
+
+    overview = build_overview(path, 168, now=datetime(2026, 8, 23, 0, 10, tzinfo=UTC))
+    meta = next(item for item in overview["providers"] if item["provider"] == "meta_ads")
+
+    assert meta["rate_per_hour"] == 10.0
+    assert meta["window_spend"] == 1.5  # $10/h over the nine minutes the series spans
+    assert overview["summary"]["window_spend_usd"] == 1.5

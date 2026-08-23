@@ -145,13 +145,16 @@ being true resolves once, and nothing repeats every thirty seconds while a provi
 Every alert carries the evidence that makes it checkable, and `alerts.jsonl` records both transitions
 as single-write append lines. Every line carries `ts` (ISO-8601 with a timezone offset) and `text`,
 the keys the task requires, plus `event` (`opened`/`resolved`), `rule`, `severity`, `provider`,
-`dedupe_key` and the evidence.
+`dedupe_key` and the evidence. Only `page` and `today` transitions reach the journal — an `fyi`
+is a state for the dashboard, not a reason for a human to look — and a closure's text starts with
+`resolved:` so the line says what it is on its own.
 
 | rule | severity | condition |
 | --- | --- | --- |
 | `collector_dead` | page | no polling cycle for three minutes |
 | `api_down` | page | every provider silent at once, raised instead of one alert each |
-| `exhausted` | page | a balance crossed zero; for postpaid, debt began |
+| `exhausted` | page | a prepaid balance reached zero |
+| `debt` | today | a postpaid account is below zero and still spending; debt between top-ups is normal, deepening debt is not |
 | `runway_1h` / `runway_5h` / `runway_24h` | page / today / fyi | predicted time to zero below the threshold |
 | `provider_silent` | today above ten cycles, else fyi | consecutive polling cycles with no data |
 | `spend_anomaly` | today | current burn is three times the provider's own four-hour baseline |
@@ -168,7 +171,8 @@ Four properties matter as much as the rules themselves:
 - **A prediction does not flap.** An open runway alert stays open until the runway recovers past one
   and a half times its threshold.
 - **Unknown is not zero.** A provider whose collection is broken is reported as blind, and no
-  prediction is made through the blind spot.
+  prediction is made through the blind spot. Its money alerts that were already open are frozen,
+  neither resolved by the silence nor reopened by the recovery.
 - **Two writers, two responsibilities.** The collector evaluates the provider rules after each cycle
   and the read surface runs the watchdog, because a dead poller cannot report its own death. Each may
   resolve only the rules it can judge, so neither closes the other's alerts.

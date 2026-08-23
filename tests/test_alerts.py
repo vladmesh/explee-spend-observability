@@ -66,16 +66,75 @@ def test_a_fresh_restart_does_not_predict_from_two_samples() -> None:
     assert evaluate(_overview(_provider(risk_hours=0.5, cycles=3)), set()) == []
 
 
-def test_crossing_zero_alerts_once_and_replaces_the_runway_alert() -> None:
-    debtor = _provider(provider="vastai", pay_model="postpaid", value=-7.5)
-    alerts = evaluate(_overview(debtor), set())
+def test_reaching_zero_pages_once_and_replaces_the_runway_alert() -> None:
+    empty = _provider(value=0.0, risk_hours=0.0)
+    alerts = evaluate(_overview(empty), set())
 
     assert [(alert.rule, alert.severity) for alert in alerts] == [("exhausted", "page")]
-    assert "accruing debt" in alerts[0].text
-    # Still one alert, still the same key: debt does not re-fire every cycle.
-    deeper = _provider(provider="vastai", pay_model="postpaid", value=-40.0)
-    again = evaluate(_overview(deeper), {alerts[0].key})
+    # Still one alert, still the same key: it does not re-fire every cycle.
+    again = evaluate(_overview(empty), {alerts[0].key})
     assert [alert.key for alert in again] == [alerts[0].key]
+
+
+def test_postpaid_debt_is_a_look_today_without_a_number_in_the_text() -> None:
+    """Debt between top-ups is how postpaid works; deepening debt deserves a look."""
+
+    debtor = _provider(provider="vastai", pay_model="postpaid", value=-7.5, rate_per_hour=-4.0)
+    alerts = evaluate(_overview(debtor), set())
+
+    assert [(alert.rule, alert.severity) for alert in alerts] == [("debt", "today")]
+    assert "7.5" not in alerts[0].text
+    assert alerts[0].evidence["value"] == -7.5
+    # Debt that is being paid down is nothing to look at.
+    recovering = _provider(provider="vastai", pay_model="postpaid", value=-7.5, rate_per_hour=2.0)
+    assert evaluate(_overview(recovering), set()) == []
+
+
+def test_a_silent_provider_freezes_its_open_money_alerts() -> None:
+    """A blind spot neither raises nor resolves a money alert."""
+
+    from explee_test.observability.alerts import frozen_keys
+
+    silent = _provider(provider="vastai", pay_model="postpaid", value=-7.5, missing_cycles=5)
+    open_now = {"debt:vastai", "runway_24h:openai", "silent:vastai"}
+
+    assert [alert.rule for alert in evaluate(_overview(silent), open_now)] == ["provider_silent"]
+    assert frozen_keys(_overview(silent), open_now) == {"debt:vastai"}
+
+
+def test_kept_alerts_survive_a_pass_that_cannot_judge_them(tmp_path) -> None:
+    from explee_test.observability.alerts import PROVIDER_RULES
+
+    path = tmp_path / "raw.sqlite3"
+    journal = tmp_path / "alerts.jsonl"
+    initialise_database(path)
+    alert = Alert(key="debt:vastai", rule="debt", severity="today", text="x", provider="vastai")
+    reconcile(path, journal, [alert], NOW, resolves=PROVIDER_RULES)
+
+    kept = reconcile(path, journal, [], NOW, resolves=PROVIDER_RULES, keep=frozenset({alert.key}))
+    assert kept == {"opened": 0, "resolved": 0, "open": 0}
+    assert open_keys(path) == {"debt:vastai"}
+    assert len(journal.read_text().splitlines()) == 1
+
+
+def test_fyi_stays_out_of_the_journal_and_closures_say_so(tmp_path) -> None:
+    import json
+
+    path = tmp_path / "raw.sqlite3"
+    journal = tmp_path / "alerts.jsonl"
+    initialise_database(path)
+    fyi = Alert(key="silent:evomi", rule="provider_silent", severity="fyi", text="quiet")
+    today = Alert(key="debt:vastai", rule="debt", severity="today", text="in debt")
+
+    reconcile(path, journal, [fyi, today], NOW)
+    reconcile(path, journal, [], NOW)
+    assert open_alerts(path) == []  # both opened and closed as states
+
+    lines = [json.loads(line) for line in journal.read_text().splitlines()]
+    assert [(line["event"], line["text"]) for line in lines] == [
+        ("opened", "in debt"),
+        ("resolved", "resolved: in debt"),
+    ]
 
 
 def test_a_blind_provider_is_reported_as_blind_and_never_predicted_through() -> None:
@@ -209,18 +268,18 @@ def test_a_condition_that_stops_being_true_closes_itself(tmp_path) -> None:
     path = tmp_path / "raw.sqlite3"
     journal = tmp_path / "alerts.jsonl"
     initialise_database(path)
-    empty = _provider(provider="vastai", pay_model="postpaid", value=-7.5)
+    empty = _provider(provider="vastai", pay_model="postpaid", value=-7.5, rate_per_hour=-1.0)
     topped_up = _provider(provider="vastai", pay_model="postpaid", value=120.0)
 
     reconcile(path, journal, evaluate(_overview(empty), set()), NOW, resolves=PROVIDER_RULES)
-    assert [alert["rule"] for alert in open_alerts(path)] == ["exhausted"]
+    assert [alert["rule"] for alert in open_alerts(path)] == ["debt"]
 
     # The balance came back; the condition is no longer true, so the alert closes.
     reconcile(path, journal, evaluate(_overview(topped_up), set()), NOW, resolves=PROVIDER_RULES)
     assert open_alerts(path) == []
 
     closed = [alert for alert in recent_alerts(path, 1) if alert["resolved_at"]]
-    assert [alert["rule"] for alert in closed] == ["exhausted"]
+    assert [alert["rule"] for alert in closed] == ["debt"]
 
 
 def test_every_journal_line_carries_the_required_ts_and_text_keys(tmp_path) -> None:

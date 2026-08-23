@@ -57,6 +57,7 @@ PROVIDER_RULES = frozenset(
         "api_down",
         "provider_silent",
         "exhausted",
+        "debt",
         "runway_1h",
         "runway_5h",
         "runway_24h",
@@ -64,6 +65,16 @@ PROVIDER_RULES = frozenset(
         "schema_drift",
     }
 )
+# Rules that judge a provider's money. While a provider is silent nothing can be
+# said about its money, so these stay exactly as they were: neither raised nor
+# resolved through the blind spot.
+MONEY_RULES = frozenset(
+    {"exhausted", "debt", "runway_1h", "runway_5h", "runway_24h", "spend_anomaly"}
+)
+# What reaches `alerts.jsonl`: a line there means "a human should look", and an
+# fyi is by definition something nobody needs to act on. It still opens and
+# resolves as a state, visible in the dashboard and its API.
+JOURNALED_SEVERITIES = frozenset({PAGE, TODAY})
 
 
 @dataclass(frozen=True)
@@ -162,24 +173,67 @@ def evaluate(
     return alerts
 
 
+def frozen_keys(overview: dict[str, Any], open_keys: set[str]) -> frozenset[str]:
+    """Open money alerts of providers that are silent right now.
+
+    Unknown is not zero, and it is not "recovered" either: an alert that was open
+    when the provider went quiet must not be resolved by the silence and reopened
+    by the recovery, which would read as the balance crossing zero twice.
+    """
+
+    silent = {
+        item["provider"]
+        for item in overview["providers"]
+        if (item.get("missing_cycles") or 0) >= SILENT_CYCLES
+    }
+    frozen = set()
+    for key in open_keys:
+        rule, _, provider = key.partition(":")
+        if rule in MONEY_RULES and provider in silent:
+            frozen.add(key)
+    return frozenset(frozen)
+
+
 def _money_alerts(item: dict[str, Any], open_keys: set[str]) -> list[Alert]:
     value = item.get("value")
     forecast = item.get("forecast") or {}
+    rate = item.get("rate_per_hour")
     if value is None:
         return []
 
+    if value <= 0 and item["pay_model"] == "postpaid":
+        # Debt is how a postpaid account works between top-ups, so the sign alone is
+        # not an incident. Debt that keeps deepening is worth a look today: the
+        # number is left out of the text because it changes every cycle while the
+        # alert stays open; it is in the evidence.
+        if rate is None or rate >= 0:
+            return []
+        return [
+            Alert(
+                key=f"debt:{item['provider']}",
+                rule="debt",
+                severity=TODAY,
+                text=(
+                    f"{item['name']} is running on debt and still spending "
+                    "(postpaid: a top-up is due)"
+                ),
+                provider=item["provider"],
+                evidence={
+                    "value": value,
+                    "rate_per_hour": rate,
+                    "unit": item["unit"],
+                    "observed_at": item["observed_at"],
+                },
+            )
+        ]
     if value <= 0:
-        # Opens once when the balance crosses zero downward and stays open while it
-        # is below; it never re-fires for a provider that lives in debt.
+        # Opens once when the balance reaches zero and stays open while it is there.
         return [
             Alert(
                 key=f"exhausted:{item['provider']}",
                 rule="exhausted",
                 severity=PAGE,
-                text=(
-                    f"{item['name']} has crossed zero: {_fmt(value, item['unit'])}"
-                    + (" (postpaid, now accruing debt)" if item["pay_model"] == "postpaid" else "")
-                ),
+                text=f"{item['name']} is out of money: {_fmt(value, item['unit'])}",
                 provider=item["provider"],
                 evidence={"value": value, "unit": item["unit"], "observed_at": item["observed_at"]},
             )
@@ -325,11 +379,17 @@ def reconcile(
     alerts: list[Alert],
     now: datetime,
     resolves: frozenset[str] | None = None,
+    keep: frozenset[str] = frozenset(),
 ) -> dict[str, int]:
     """Open what became true, resolve what stopped being true, repeat nothing.
 
     ``resolves`` names the rules this caller is responsible for. Anything else that
     is open stays open: a writer must not close a condition it cannot evaluate.
+    ``keep`` names open alerts that must survive this pass untouched, because the
+    caller could not judge them this time (see `frozen_keys`).
+
+    Only page and today transitions reach the journal; an fyi is a state for the
+    dashboard, not a reason for a human to look.
     """
 
     initialise_database(path)
@@ -365,23 +425,24 @@ def reconcile(
                 ),
             )
             opened += 1
-            _write_line(
-                journal,
-                {
-                    "ts": stamp,
-                    "at": stamp,
-                    "event": "opened",
-                    "rule": alert.rule,
-                    "severity": alert.severity,
-                    "provider": alert.provider,
-                    "text": alert.text,
-                    "evidence": alert.evidence,
-                    "dedupe_key": key,
-                },
-            )
+            if alert.severity in JOURNALED_SEVERITIES:
+                _write_line(
+                    journal,
+                    {
+                        "ts": stamp,
+                        "at": stamp,
+                        "event": "opened",
+                        "rule": alert.rule,
+                        "severity": alert.severity,
+                        "provider": alert.provider,
+                        "text": alert.text,
+                        "evidence": alert.evidence,
+                        "dedupe_key": key,
+                    },
+                )
 
         for key, row in current.items():
-            if key in wanted:
+            if key in wanted or key in keep:
                 continue
             if resolves is not None and row["rule"] not in resolves:
                 continue
@@ -389,20 +450,23 @@ def reconcile(
                 "UPDATE alerts SET resolved_at = ? WHERE id = ?", (stamp, row["id"])
             )
             resolved += 1
-            _write_line(
-                journal,
-                {
-                    "ts": stamp,
-                    "at": stamp,
-                    "event": "resolved",
-                    "rule": row["rule"],
-                    "severity": row["severity"],
-                    "provider": row["provider"],
-                    "text": row["text"],
-                    "opened_at": row["emitted_at"],
-                    "dedupe_key": key,
-                },
-            )
+            if row["severity"] in JOURNALED_SEVERITIES:
+                _write_line(
+                    journal,
+                    {
+                        "ts": stamp,
+                        "at": stamp,
+                        "event": "resolved",
+                        "rule": row["rule"],
+                        "severity": row["severity"],
+                        "provider": row["provider"],
+                        # The line must say on its own that this is a closure, so a
+                        # reader of `ts` and `text` never mistakes it for a repeat.
+                        "text": f"resolved: {row['text']}",
+                        "opened_at": row["emitted_at"],
+                        "dedupe_key": key,
+                    },
+                )
     return {"opened": opened, "resolved": resolved, "open": len(wanted)}
 
 
@@ -492,5 +556,8 @@ def evaluate_and_store(path: Path, journal: Path, now: datetime | None = None) -
 
     now = now or datetime.now(UTC)
     overview = build_overview(path, hours=2, now=now)
-    alerts = evaluate(overview, open_keys(path), path)
-    return reconcile(path, journal, alerts, now, resolves=PROVIDER_RULES)
+    current = open_keys(path)
+    alerts = evaluate(overview, current, path)
+    return reconcile(
+        path, journal, alerts, now, resolves=PROVIDER_RULES, keep=frozen_keys(overview, current)
+    )

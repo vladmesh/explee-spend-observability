@@ -278,7 +278,7 @@ def test_a_condition_that_stops_being_true_closes_itself(tmp_path) -> None:
     reconcile(path, journal, evaluate(_overview(topped_up), set()), NOW, resolves=PROVIDER_RULES)
     assert open_alerts(path) == []
 
-    closed = [alert for alert in recent_alerts(path, 1) if alert["resolved_at"]]
+    closed = [alert for alert in recent_alerts(path, 1, now=NOW) if alert["resolved_at"]]
     assert [alert["rule"] for alert in closed] == ["debt"]
 
 

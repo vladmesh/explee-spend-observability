@@ -517,14 +517,18 @@ def open_alerts(path: Path) -> list[dict[str, Any]]:
     return sorted(items, key=lambda item: (order.get(item["severity"], 3), item["at"]))
 
 
-def recent_alerts(path: Path, hours: int = 12) -> list[dict[str, Any]]:
+def recent_alerts(
+    path: Path, hours: int = 12, now: datetime | None = None
+) -> list[dict[str, Any]]:
     """Alerts that opened within the window, resolved ones included.
 
     An alert that came and went is the most useful thing to look at once it is
-    gone, and it is exactly what the open list can no longer show.
+    gone, and it is exactly what the open list can no longer show. `now` is the
+    end of the window; it defaults to the wall clock and exists so callers with
+    their own clock (tests included) are not tied to it.
     """
 
-    cutoff = (datetime.now(UTC) - timedelta(hours=hours)).isoformat()
+    cutoff = ((now or datetime.now(UTC)) - timedelta(hours=hours)).isoformat()
     with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as connection:
         connection.row_factory = sqlite3.Row
         try:

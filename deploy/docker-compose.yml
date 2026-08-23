@@ -1,0 +1,54 @@
+services:
+  dashboard:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: explee-dashboard
+    environment:
+      EXPLEE_DATABASE_PATH: /app/data/raw.sqlite3
+      # Both processes append to the same journal, and it has to survive a rebuild.
+      EXPLEE_ALERTS_PATH: /app/data/alerts.jsonl
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+    networks:
+      - personal_site
+
+  poller:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: explee-poller
+    command:
+      - python
+      - -m
+      - explee_test.observability.raw_poller
+      - --interval
+      - "30"
+      - --db
+      - /app/data/raw.sqlite3
+      - --jsonl
+      - /app/data/raw_responses.jsonl
+    environment:
+      EXPLEE_DATABASE_PATH: /app/data/raw.sqlite3
+      EXPLEE_ALERTS_PATH: /app/data/alerts.jsonl
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+    networks:
+      - personal_site
+
+networks:
+  personal_site:
+    external: true
+    name: personal_site_network

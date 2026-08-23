@@ -1,0 +1,11 @@
+.git
+.github
+.venv
+.pytest_cache
+.ruff_cache
+artifacts
+data
+notes
+tests
+alerts.jsonl
+*.pyc

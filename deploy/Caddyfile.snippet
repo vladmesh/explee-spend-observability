@@ -1,0 +1,8 @@
+5vei.l.time4vps.cloud {
+  encode zstd gzip
+  reverse_proxy explee-dashboard:8000
+
+  header Strict-Transport-Security "max-age=31536000; includeSubDomains"
+  header X-Content-Type-Options "nosniff"
+  header Referrer-Policy "strict-origin-when-cross-origin"
+}

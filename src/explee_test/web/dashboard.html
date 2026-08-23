@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="description" content="Live provider spend and observation-quality telemetry">
+  <title>Provider spend observability</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <script defer src="/static/vendor/echarts-5.6.0.min.js"></script>
+  <script defer src="/static/app.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <button id="home" class="home" type="button" title="Back to the default view (Esc)">
+      <span class="eyebrow">Explee · task 01</span>
+      <h1>Provider spend</h1>
+    </button>
+    <div class="topbar-controls">
+      <div class="range-control">
+        <label for="range">Observation window</label>
+        <select id="range">
+          <option value="1">Last hour</option>
+          <option value="6">Last 6 hours</option>
+          <option value="12" selected>Last 12 hours</option>
+          <option value="24">Last 24 hours</option>
+          <option value="168">Last 7 days</option>
+        </select>
+      </div>
+      <button id="collection-chip" class="chip-status" type="button" aria-expanded="false">Collection …</button>
+      <span id="updated" class="updated">Loading…</span>
+    </div>
+  </header>
+
+  <main>
+    <section id="answer" class="answer-grid" aria-label="Spend summary"></section>
+
+    <div id="filters" class="filters" aria-label="Active filters"></div>
+
+    <button id="alert-bar" class="alert-bar" type="button" hidden></button>
+
+    <section id="alerts-panel" class="panel alerts-panel" hidden>
+      <div class="panel-heading">
+        <div>
+          <p class="section-kicker">Needs a decision</p>
+          <h2>Alerts</h2>
+        </div>
+        <p>Each one opened when its condition became true and closes when it stops being true. Click any row to see the provider and the window it was raised in.</p>
+        <button id="close-alerts" class="panel-close" type="button" aria-label="Close alerts">×</button>
+      </div>
+      <ul id="alerts" class="alert-list"></ul>
+      <h3 class="alert-history-title">Came and went in this window</h3>
+      <ul id="alerts-history" class="alert-list history"></ul>
+    </section>
+
+    <section class="panel events-panel">
+      <div class="panel-heading">
+        <div>
+          <p class="section-kicker">What happened</p>
+          <h2>Events</h2>
+        </div>
+        <div class="segmented" role="group" aria-label="Event kinds">
+          <button type="button" data-events="money" class="active">Money</button>
+          <button type="button" data-events="collection">Collection</button>
+          <button type="button" data-events="all">All</button>
+        </div>
+      </div>
+      <div class="strip-wrap">
+        <div id="event-strip" class="event-strip"></div>
+        <div id="strip-axis" class="strip-axis"></div>
+      </div>
+      <ul id="event-list" class="event-list"></ul>
+    </section>
+
+    <section class="panel provider-panel">
+      <div class="panel-heading">
+        <div>
+          <p class="section-kicker">Current state</p>
+          <h2>Providers</h2>
+        </div>
+        <div class="table-controls">
+          <select id="model-filter" aria-label="Pay model">
+            <option value="">All pay models</option>
+            <option value="prepaid_balance">Prepaid balance</option>
+            <option value="credits_package">Credits package</option>
+            <option value="spend_report">Spend report</option>
+            <option value="postpaid">Postpaid</option>
+          </select>
+          <select id="status-filter" aria-label="Status">
+            <option value="">Any status</option>
+            <option value="at_risk">Running out</option>
+            <option value="degraded">Collection degraded</option>
+            <option value="stale">Data stale</option>
+          </select>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th data-sort="name">Provider</th>
+              <th data-sort="value">Current</th>
+              <th data-sort="rate">Rate</th>
+              <th data-sort="relative">Share / hour</th>
+              <th data-sort="risk">Time to zero</th>
+              <th>Trend</th>
+              <th data-sort="status">Cycles with data</th>
+            </tr>
+          </thead>
+          <tbody id="providers"></tbody>
+        </table>
+      </div>
+      <p id="table-caption" class="table-caption"></p>
+      <p id="table-empty" class="table-empty" hidden>No provider matches the active filters.</p>
+    </section>
+
+    <section id="collection" class="panel collection-panel" hidden>
+      <div class="panel-heading">
+        <div>
+          <p class="section-kicker">Collection quality</p>
+          <h2>Attempts and errors</h2>
+        </div>
+        <p>Bars are failed attempts per bucket by cause; the line is the share of valid observations. A throttled attempt whose retry succeeded in the same cycle is not drawn: no data was lost. Click a bar to narrow every panel to that moment and cause.</p>
+        <button id="close-collection" class="panel-close" type="button" aria-label="Close collection quality">×</button>
+      </div>
+      <div id="quality-chart" class="chart chart-quality" role="img" aria-label="Error density over time"></div>
+    </section>
+
+    <section id="detail" class="panel detail-panel" hidden>
+      <div class="panel-heading detail-heading">
+        <div>
+          <p id="detail-kind" class="section-kicker"></p>
+          <h2 id="detail-title"></h2>
+        </div>
+        <div class="detail-actions">
+          <div class="segmented" role="tablist" aria-label="Provider views">
+            <button type="button" data-tab="value" class="active" role="tab">Value</button>
+            <button type="button" data-tab="attempts" role="tab">Attempts</button>
+            <button type="button" data-tab="raw" role="tab">Source</button>
+          </div>
+          <button id="close-detail" class="panel-close" type="button" aria-label="Close provider detail" title="Close (Esc)">×</button>
+        </div>
+      </div>
+      <div class="tab-pane" data-pane="value">
+        <div id="value-chart" class="chart chart-value"></div>
+        <p class="hint">Vertical marks are detected events. Click any point to load the stored response it came from. A series that is another one times a constant starts hidden in the legend.</p>
+      </div>
+      <div class="tab-pane" data-pane="attempts" hidden>
+        <div id="outcome-chart" class="chart chart-outcomes"></div>
+      </div>
+      <div class="tab-pane" data-pane="raw" hidden>
+        <div class="raw-block">
+          <div>
+            <h3>Source payload</h3>
+            <p id="raw-meta"></p>
+          </div>
+          <pre id="raw-payload"></pre>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    Raw responses are immutable. Every plotted value keeps the identifier of the response it was derived from.
+  </footer>
+</body>
+</html>

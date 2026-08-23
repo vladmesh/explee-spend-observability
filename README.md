@@ -3,7 +3,23 @@
 Live view of what fifteen provider billing APIs are costing, what is about to run out, and whether
 the numbers on screen can be trusted. Built for the [Explee AI-native Developer test](https://jobs.explee.com/ai-native-developer/test), task 1.
 
-**Live dashboard: <https://5vei.l.time4vps.cloud/>**
+**Live dashboard: <https://5vei.l.time4vps.cloud/>** — opens without login; the deployment runs this
+repository's `main` (`/opt/services/explee` on the host is a checkout of it).
+
+## Submission
+
+What the task asks for and where each piece is:
+
+| deliverable | where |
+| --- | --- |
+| code | this repository |
+| dashboard | <https://5vei.l.time4vps.cloud/> |
+| `alerts.jsonl` | written by the collector on the host to `deploy/data/alerts.jsonl`; a copy is attached to the submission. One JSON line per transition with `ts` (ISO-8601, offset), `text`, `event` (`opened`/`resolved`), `rule`, `severity`, `provider`, `dedupe_key` and `evidence`; only `page` and `today` reach the file |
+| `TRACE.md` | the agent conversations are kept in the private working repository and attached to the submission |
+
+The collector has run continuously since 2026-08-22T13:51Z; the journal in its current form starts
+at 2026-08-23T12:58Z, when the alert policy reached its final shape, and everything written before
+that is kept on the host under `deploy/data/archive/`.
 
 ## What it does
 
@@ -22,12 +38,13 @@ code that acts on them.
 
 - **[`docs/TASK1_DASHBOARD.md`](docs/TASK1_DASHBOARD.md)** — the pipeline, the outcome contract, how
   rates and projections are computed, the alert policy, and the screen model.
-- **[`observability/alerts.py`](src/explee_test/observability/alerts.py)** — eight rules, each with
+- **[`observability/alerts.py`](src/explee_test/observability/alerts.py)** — nine rules, each with
   the reason its threshold is what it is.
 - **[`observability/events.py`](src/explee_test/observability/events.py)** — top-ups, package resets,
   drawdowns, spend spikes, source glitches and outages, derived from stored observations.
-- **[`Opus_review.md`](Opus_review.md)** — a ranked review of this codebase with what was wrong, what
-  was fixed, and what is still open. It includes the measurements behind several of the decisions.
+- **[`Opus_review.md`](Opus_review.md)** and **[`Fable_review.md`](Fable_review.md)** — two ranked
+  reviews of this codebase with what was wrong, what was fixed, and what is still open. They include
+  the measurements behind several of the decisions.
 - **[`notes/polling/`](notes/polling)** — observations taken while the collector ran.
 
 Three findings shaped the implementation more than anything else:

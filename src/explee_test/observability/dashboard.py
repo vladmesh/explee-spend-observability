@@ -900,16 +900,27 @@ def build_provider_detail(
         raise KeyError(provider)
     cutoff, until, _ = _window(hours, datetime.now(UTC), start, end)
     with _connect(path) as connection:
+        # The columns the plotted series is made of, and no others: every column
+        # asked for that the index does not carry sends the reader back to the table
+        # once per sample. The capacity is a property of the newest sample alone, so
+        # it is asked for separately rather than fetched with every one of them.
         observations = connection.execute(
             """
-            SELECT observed_at, metric_name, value, capacity, unit, refresh_at,
-                   labels_json, raw_response_id
+            SELECT observed_at, metric_name, value, unit, labels_json, raw_response_id
             FROM observations
             WHERE provider = ? AND observed_at >= ? AND observed_at <= ?
             ORDER BY observed_at
             """,
             (provider, cutoff, until),
         ).fetchall()
+        capacity = connection.execute(
+            """
+            SELECT capacity FROM observations
+            WHERE provider = ? AND observed_at >= ? AND observed_at <= ?
+            ORDER BY observed_at DESC, id DESC LIMIT 1
+            """,
+            (provider, cutoff, until),
+        ).fetchone()
         attempts = connection.execute(
             """
             SELECT r.requested_at, r.status_code, r.latency_ms, r.cycle_id, r.attempt,
@@ -921,13 +932,18 @@ def build_provider_detail(
             """,
             (provider, cutoff, until),
         ).fetchall()
+        # The newest success is found by walking this provider's index backwards and
+        # stopping at the first one. Left to itself the planner drove the join from
+        # the outcome index instead, which collected every success ever recorded, for
+        # every provider, and sorted them all to keep one row; CROSS JOIN is how
+        # SQLite is told which table leads.
         latest_raw = connection.execute(
             """
             SELECT r.id, r.requested_at, r.body_text
-            FROM processing_results AS p
-            JOIN raw_responses AS r ON r.id = p.raw_response_id
+            FROM raw_responses AS r
+            CROSS JOIN processing_results AS p ON p.raw_response_id = r.id
             WHERE r.provider = ? AND p.outcome = 'success'
-            ORDER BY r.id DESC LIMIT 1
+            ORDER BY r.requested_at DESC LIMIT 1
             """,
             (provider,),
         ).fetchone()
@@ -952,7 +968,7 @@ def build_provider_detail(
         definition.pay_model,
         definition.unit,
         primary,
-        observations[-1]["capacity"] if observations else None,
+        capacity["capacity"] if capacity else None,
     )
     events.extend(detect_outages(provider, _cycle_outcomes(attempts)))
     return {

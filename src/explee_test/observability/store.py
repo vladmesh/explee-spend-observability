@@ -75,8 +75,9 @@ CREATE TABLE IF NOT EXISTS observations (
     FOREIGN KEY(raw_response_id) REFERENCES raw_responses(id),
     UNIQUE(raw_response_id, metric_name, labels_json)
 );
-CREATE INDEX IF NOT EXISTS observations_provider_time
-    ON observations(provider, observed_at);
+CREATE INDEX IF NOT EXISTS observations_provider_window
+    ON observations(provider, observed_at, metric_name, value, unit, labels_json,
+                    raw_response_id);
 CREATE INDEX IF NOT EXISTS observations_metric_time
     ON observations(metric_name, observed_at);
 CREATE INDEX IF NOT EXISTS observations_window
@@ -105,6 +106,8 @@ DROP INDEX IF EXISTS raw_responses_time;
 DROP INDEX IF EXISTS observations_time;
 -- A strict prefix of raw_responses_provider_window, so it answers nothing extra.
 DROP INDEX IF EXISTS raw_responses_provider_time;
+-- A strict prefix of observations_provider_window.
+DROP INDEX IF EXISTS observations_provider_time;
 CREATE UNIQUE INDEX IF NOT EXISTS alerts_open_key
     ON alerts(dedupe_key) WHERE resolved_at IS NULL;
 CREATE INDEX IF NOT EXISTS alerts_emitted ON alerts(emitted_at);

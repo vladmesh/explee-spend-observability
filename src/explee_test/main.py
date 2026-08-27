@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import logging
 import sqlite3
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -84,7 +85,11 @@ async def refresher() -> None:
             for key in cache.refresh_due()[:1]:
                 # A key that cannot be built must not end the loop.
                 with contextlib.suppress(Exception):
+                    started = time.monotonic()
                     await asyncio.to_thread(cache.rebuild, key)
+                    logging.getLogger(__name__).info(
+                        "rebuilt %s in %.2fs", key, time.monotonic() - started
+                    )
         await asyncio.sleep(REFRESH_INTERVAL_SECONDS)
 
 

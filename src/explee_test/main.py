@@ -139,19 +139,25 @@ async def watchdog() -> None:
     """
 
     settings = get_settings()
+
+    def reconcile_now() -> None:
+        now = datetime.now(UTC)
+        reconcile(
+            settings.database_path,
+            settings.alerts_path,
+            collector_alerts(settings.database_path, now),
+            now,
+            resolves=COLLECTOR_RULES,
+        )
+
     while True:
         await asyncio.sleep(WATCHDOG_INTERVAL_SECONDS)
-        try:
-            now = datetime.now(UTC)
-            reconcile(
-                settings.database_path,
-                settings.alerts_path,
-                collector_alerts(settings.database_path, now),
-                now,
-                resolves=COLLECTOR_RULES,
-            )
-        except Exception:  # noqa: BLE001 - the read surface must stay up regardless
-            pass
+        # In a thread, because this writes: it waits for the collector's write lock,
+        # and waiting for it on the event loop stops the server accepting anything at
+        # all. That was the page freezing for as long as a poll cycle took to write.
+        # The read surface must stay up regardless of what the write finds.
+        with contextlib.suppress(Exception):
+            await asyncio.to_thread(reconcile_now)
 
 
 @asynccontextmanager

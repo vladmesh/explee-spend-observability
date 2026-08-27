@@ -188,11 +188,21 @@ def _migrate(connection: sqlite3.Connection) -> None:
 SCHEMA_LOCK_TIMEOUT_SECONDS = 60.0
 
 
+# Bump this whenever anything above changes. A database stamped with the current
+# version is left alone, which is what keeps the schema out of the way of the
+# collector: applying it takes the write lock, both processes call this on every
+# alert reconciliation, and a no-op that still takes the write lock is not a no-op.
+SCHEMA_VERSION = 3
+
+
 def initialise_database(path: Path) -> None:
     """Create the durable store without requiring an external service."""
 
     path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(path, timeout=SCHEMA_LOCK_TIMEOUT_SECONDS) as connection:
+        if connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION:
+            return
         connection.executescript(SCHEMA)
         _migrate(connection)
         connection.executescript(POST_MIGRATION_SCHEMA)
+        connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")

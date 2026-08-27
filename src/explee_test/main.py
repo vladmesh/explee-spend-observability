@@ -17,6 +17,7 @@ from explee_test.observability.alerts import (
     recent_alerts,
     reconcile,
 )
+from explee_test.observability.cache import ProjectionCache
 from explee_test.observability.dashboard import (
     build_overview,
     build_provider_detail,
@@ -43,6 +44,44 @@ IMMUTABLE_PREFIX = "/static/vendor/"
 # hours; "no-cache" still allows a 304, so revalidation stays cheap.
 REVALIDATE = "no-cache"
 WATCHDOG_INTERVAL_SECONDS = 30.0
+REFRESH_INTERVAL_SECONDS = 5.0
+# The windows the page offers. They are kept built, because the first viewer of a
+# week should not be the one who pays for it.
+PRESET_HOURS = (1, 6, 12, 24, 168)
+
+
+# The database is part of the key, not read from settings inside the build: a
+# projection of one capture must never be handed out as a projection of another.
+def _overview(database: str, hours: int, start: str | None, end: str | None) -> dict:
+    return build_overview(database, hours, start=start, end=end)
+
+
+def _provider_detail(
+    database: str, provider: str, hours: int, start: str | None, end: str | None
+) -> dict:
+    return build_provider_detail(database, provider, hours, start=start, end=end)
+
+
+overview_cache = ProjectionCache(_overview)
+# A drill-down is one provider out of fifteen in one of five windows, which is too
+# many combinations to keep built; it is kept only while someone is reading it.
+detail_cache = ProjectionCache(_provider_detail)
+
+
+async def refresher() -> None:
+    """Rebuild what is being looked at, off the request path.
+
+    One rebuild at a time and in a worker thread: the host has a single core, and a
+    request waiting on the event loop must not be behind a projection being built.
+    """
+
+    while True:
+        for cache in (overview_cache, detail_cache):
+            for key in cache.refresh_due():
+                # A key that cannot be built must not end the loop.
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(cache.rebuild, key)
+        await asyncio.sleep(REFRESH_INTERVAL_SECONDS)
 
 
 async def watchdog() -> None:
@@ -74,13 +113,18 @@ async def watchdog() -> None:
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     database_path = get_settings().database_path
     initialise_database(database_path)
-    task = asyncio.create_task(watchdog())
+    overview_cache.keep_warm(
+        tuple((str(database_path), hours, None, None) for hours in PRESET_HOURS)
+    )
+    tasks = [asyncio.create_task(watchdog()), asyncio.create_task(refresher())]
     try:
         yield
     finally:
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
 
 app = FastAPI(title="Explee Spend Observability", version=__version__, lifespan=lifespan)
@@ -118,7 +162,7 @@ def overview(
     end: str | None = Query(default=None),
 ) -> dict:
     try:
-        return build_overview(get_settings().database_path, hours, start=start, end=end)
+        return overview_cache.get((str(get_settings().database_path), hours, start, end))
     except ValueError as exc:
         raise HTTPException(status_code=422, detail="Invalid window") from exc
 
@@ -131,8 +175,8 @@ def provider_detail(
     end: str | None = Query(default=None),
 ) -> dict:
     try:
-        return build_provider_detail(
-            get_settings().database_path, provider, hours, start=start, end=end
+        return detail_cache.get(
+            (str(get_settings().database_path), provider, hours, start, end)
         )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Unknown provider") from exc

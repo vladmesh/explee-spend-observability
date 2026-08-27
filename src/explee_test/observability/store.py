@@ -28,8 +28,11 @@ CREATE TABLE IF NOT EXISTS raw_responses (
     error_type TEXT,
     error_message TEXT
 );
-CREATE INDEX IF NOT EXISTS raw_responses_provider_time
-    ON raw_responses(provider, requested_at);
+-- One provider's window, with the columns the drill-down reads riding along for the
+-- same reason as the index below: the alternative is one random read of a table full
+-- of captured bodies per attempt.
+CREATE INDEX IF NOT EXISTS raw_responses_provider_window
+    ON raw_responses(provider, requested_at, cycle_id, attempt, status_code, latency_ms);
 CREATE INDEX IF NOT EXISTS raw_responses_cycle ON raw_responses(cycle_id);
 -- The dashboard asks for a window across all providers, and the composite index
 -- above cannot serve a range on its second column, so every page view scanned the
@@ -100,6 +103,8 @@ POST_MIGRATION_SCHEMA = """
 -- that already carries them does not keep paying for them on every insert.
 DROP INDEX IF EXISTS raw_responses_time;
 DROP INDEX IF EXISTS observations_time;
+-- A strict prefix of raw_responses_provider_window, so it answers nothing extra.
+DROP INDEX IF EXISTS raw_responses_provider_time;
 CREATE UNIQUE INDEX IF NOT EXISTS alerts_open_key
     ON alerts(dedupe_key) WHERE resolved_at IS NULL;
 CREATE INDEX IF NOT EXISTS alerts_emitted ON alerts(emitted_at);

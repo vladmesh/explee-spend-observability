@@ -94,10 +94,15 @@ class ProjectionCache:
             return self._rebuild(key)
 
     def refresh_due(self) -> list[tuple]:
-        """Keys worth rebuilding now: warm ones, and ones still being looked at."""
+        """Keys worth rebuilding now, the most overdue first.
+
+        The caller rebuilds one at a time, so the order is the whole answer to which
+        projection has been waiting longest relative to how often it asked to be
+        rebuilt. A key with nothing built yet has waited forever.
+        """
 
         now = time.monotonic()
-        due = []
+        due: list[tuple[float, tuple]] = []
         with self._guard:
             for key in list(self._entries):
                 entry = self._entries[key]
@@ -109,10 +114,12 @@ class ProjectionCache:
                     self._building.pop(key, None)
                     continue
                 interval = max(self._minimum_age, self._refresh_factor * entry.build_seconds)
-                if now - entry.built_at >= interval:
-                    due.append(key)
-            due.extend(key for key in self._warm if key not in self._entries)
-        return due
+                overdue = (now - entry.built_at) / interval
+                if overdue >= 1.0:
+                    due.append((overdue, key))
+            missing = [key for key in self._warm if key not in self._entries]
+        due.sort(key=lambda item: item[0], reverse=True)
+        return missing + [key for _, key in due]
 
     def rebuild(self, key: tuple) -> None:
         """Refresh one key, holding its build lock so a request does not duplicate it."""

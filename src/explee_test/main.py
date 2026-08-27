@@ -73,13 +73,15 @@ detail_cache = ProjectionCache(_provider_detail)
 async def refresher() -> None:
     """Rebuild what is being looked at, off the request path.
 
-    One rebuild at a time and in a worker thread: the host has a single core, and a
-    request waiting on the event loop must not be behind a projection being built.
+    One projection per tick and in a worker thread: the host has a single core, and
+    rebuilding everything that has come due in one go stalls every request for the
+    sum of them. Spread out, the longest a request can wait behind the refresher is
+    one projection, and the ones that come due most often are the cheap ones.
     """
 
     while True:
         for cache in (overview_cache, detail_cache):
-            for key in cache.refresh_due():
+            for key in cache.refresh_due()[:1]:
                 # A key that cannot be built must not end the loop.
                 with contextlib.suppress(Exception):
                     await asyncio.to_thread(cache.rebuild, key)

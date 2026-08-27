@@ -286,6 +286,23 @@ def _percentile_rank_sql(quantile: float) -> str:
     )
 
 
+def _rows(cursor: sqlite3.Cursor, chunk: int = 2000) -> list[sqlite3.Row]:
+    """Drain a cursor in chunks so the interpreter can run something else.
+
+    `fetchall` over a wide window is a single C call that builds two hundred
+    thousand rows without ever releasing the interpreter lock, so every other
+    request on this process waits for the whole of it. Nothing else is served for
+    seconds while a projection is rebuilt in the background. Draining the same rows
+    a chunk at a time returns the identical list and gives the lock back between
+    chunks.
+    """
+
+    collected: list[sqlite3.Row] = []
+    while batch := cursor.fetchmany(chunk):
+        collected.extend(batch)
+    return collected
+
+
 def _rounded(rows) -> dict[int, float]:
     return {bucket: round(value, 1) for bucket, value in rows}
 
@@ -500,7 +517,7 @@ def build_overview(
         # Only the cycles that delivered nothing come out, each carrying its position
         # among the cycles an outage can be built from. Consecutive positions are one
         # outage, so the successful cycles between them never have to be carried.
-        outage_rows = connection.execute(
+        outage_rows = _rows(connection.execute(
             """
             WITH kept AS (
                 SELECT provider, at, covered, dominant,
@@ -512,7 +529,7 @@ def build_overview(
             WHERE covered = 0
             ORDER BY provider, at
             """
-        ).fetchall()
+        ))
         bucket_rows = connection.execute(
             f"SELECT {bucket_sql} AS bucket, category, count(*) "
             "FROM counted GROUP BY bucket, category"
@@ -577,7 +594,7 @@ def build_overview(
         # Only the columns the plotted series is made of. Asking for the whole row
         # sent the reader back to the table for every sample; these five live in the
         # index the range is scanned on.
-        observation_rows = connection.execute(
+        observation_rows = _rows(connection.execute(
             """
             SELECT provider, observed_at, value, raw_response_id, labels_json
             FROM observations
@@ -585,7 +602,7 @@ def build_overview(
             ORDER BY observed_at
             """,
             (cutoff, until),
-        ).fetchall()
+        ))
         # A provider writes at most a couple of series per poll, so its newest
         # sample of each is inside a short tail; the ordering matches the
         # (provider, observed_at) index, so this reads a handful of rows.
@@ -904,7 +921,7 @@ def build_provider_detail(
         # asked for that the index does not carry sends the reader back to the table
         # once per sample. The capacity is a property of the newest sample alone, so
         # it is asked for separately rather than fetched with every one of them.
-        observations = connection.execute(
+        observations = _rows(connection.execute(
             """
             SELECT observed_at, metric_name, value, unit, labels_json, raw_response_id
             FROM observations
@@ -912,7 +929,7 @@ def build_provider_detail(
             ORDER BY observed_at
             """,
             (provider, cutoff, until),
-        ).fetchall()
+        ))
         capacity = connection.execute(
             """
             SELECT capacity FROM observations
@@ -921,7 +938,7 @@ def build_provider_detail(
             """,
             (provider, cutoff, until),
         ).fetchone()
-        attempts = connection.execute(
+        attempts = _rows(connection.execute(
             """
             SELECT r.requested_at, r.status_code, r.latency_ms, r.cycle_id, r.attempt,
                    p.outcome, p.error_code
@@ -931,7 +948,7 @@ def build_provider_detail(
             ORDER BY r.requested_at
             """,
             (provider, cutoff, until),
-        ).fetchall()
+        ))
         # The newest success is found by walking this provider's index backwards and
         # stopping at the first one. Left to itself the planner drove the join from
         # the outcome index instead, which collected every success ever recorded, for

@@ -25,9 +25,11 @@ from typing import Any
 # The collector writes every thirty seconds, so nothing is gained by rebuilding
 # faster than that.
 MINIMUM_AGE_SECONDS = 30.0
-# An answer that takes a second may be rebuilt every eight; one that takes six may
-# not. The host has one core and also has to run the collector.
-REFRESH_FACTOR = 8.0
+# An answer that takes a second may be rebuilt every twenty; one that takes six may
+# not. The host has one core, so a rebuild is time no request can be served in, and
+# the wider the window the less a poll cycle changes it: a week moves by 0.3% while
+# the projection of it is two minutes old, which is not worth stalling viewers for.
+REFRESH_FACTOR = 20.0
 # Past this age a cached answer is no longer served: the caller waits for a fresh
 # one. This is what a viewer sees if the refresher is not running at all.
 STALE_AFTER_SECONDS = 120.0

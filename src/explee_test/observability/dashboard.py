@@ -488,15 +488,13 @@ def build_overview(
             "SELECT provider, category, count(*) FROM counted GROUP BY provider, category"
         ):
             outcome_counts[provider][category] = count
+        # `covered` already travels with the attempt, so this is a scan and not a
+        # join: joining the two temporary tables had no index to work with and cost
+        # a minute on a week-long window.
         throttled_recovered = dict(
             connection.execute(
-                """
-                SELECT att.provider, count(*)
-                FROM att
-                JOIN cyc ON cyc.provider = att.provider AND cyc.cycle_id = att.cycle_id
-                WHERE att.outcome = 'throttled' AND cyc.covered = 1
-                GROUP BY att.provider
-                """
+                "SELECT provider, count(*) FROM att "
+                "WHERE outcome = 'throttled' AND covered = 1 GROUP BY provider"
             )
         )
         # Only the cycles that delivered nothing come out, each carrying its position

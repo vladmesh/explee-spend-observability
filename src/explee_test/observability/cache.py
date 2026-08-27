@@ -19,6 +19,7 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Callable, Hashable
+from concurrent.futures import Executor
 from dataclasses import dataclass
 from typing import Any
 
@@ -52,6 +53,7 @@ class ProjectionCache:
         self,
         build: Callable[..., Any],
         *,
+        executor: Executor | None = None,
         warm: tuple[tuple, ...] = (),
         minimum_age: float = MINIMUM_AGE_SECONDS,
         refresh_factor: float = REFRESH_FACTOR,
@@ -59,6 +61,7 @@ class ProjectionCache:
         demand_seconds: float = DEMAND_SECONDS,
     ) -> None:
         self._build = build
+        self._executor = executor
         self._warm = set(warm)
         self._minimum_age = minimum_age
         self._refresh_factor = refresh_factor
@@ -69,6 +72,17 @@ class ProjectionCache:
         # One build per key at a time: without this, two viewers arriving together
         # on a cold window each pay the full cost and the host pays twice.
         self._building: dict[Hashable, threading.Lock] = {}
+
+    def build_elsewhere(self, executor: Executor | None) -> None:
+        """Build in another process rather than this one.
+
+        A projection is seconds of work that holds the interpreter lock, and this
+        process also has to answer requests that are already in memory. Sharing a
+        core with the build is survivable; sharing an interpreter lock with it is
+        not, and it showed as the page freezing for as long as a rebuild took.
+        """
+
+        self._executor = executor
 
     def keep_warm(self, keys: tuple[tuple, ...]) -> None:
         """Name the keys to keep built even when nobody is asking for them."""
@@ -91,7 +105,9 @@ class ProjectionCache:
                 entry = self._entries.get(key)
                 if entry is not None and time.monotonic() - entry.built_at < self._stale_after:
                     return entry.payload
-            return self._rebuild(key)
+            # A caller is already waiting on this one, so it is built here: handing
+            # it to the builder would only add the trip there and back.
+            return self._rebuild(key, elsewhere=False)
 
     def refresh_due(self) -> list[tuple]:
         """Keys worth rebuilding now, the most overdue first.
@@ -127,11 +143,14 @@ class ProjectionCache:
         with self._guard:
             lock = self._building.setdefault(key, threading.Lock())
         with lock:
-            self._rebuild(key)
+            self._rebuild(key, elsewhere=True)
 
-    def _rebuild(self, key: tuple) -> Any:
+    def _rebuild(self, key: tuple, *, elsewhere: bool) -> Any:
         started = time.monotonic()
-        payload = self._build(*key)
+        if elsewhere and self._executor is not None:
+            payload = self._executor.submit(self._build, *key).result()
+        else:
+            payload = self._build(*key)
         finished = time.monotonic()
         with self._guard:
             previous = self._entries.get(key)

@@ -1,9 +1,12 @@
 import asyncio
 import contextlib
 import logging
+import multiprocessing
+import os
 import sqlite3
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
+from concurrent.futures import ProcessPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -56,6 +59,12 @@ REFRESH_INTERVAL_SECONDS = 5.0
 PRESET_HOURS = (1, 6, 12, 24, 168)
 
 
+def _stand_aside() -> None:
+    """Run the builder below everything else: it has time, a viewer does not."""
+
+    os.nice(10)
+
+
 # The database is part of the key, not read from settings inside the build: a
 # projection of one capture must never be handed out as a projection of another.
 def _overview(database: str, hours: int, start: str | None, end: str | None) -> dict:
@@ -74,26 +83,50 @@ overview_cache = ProjectionCache(_overview)
 detail_cache = ProjectionCache(_provider_detail)
 
 
+_builder: ProcessPoolExecutor | None = None
+
+
+def _builder_pool() -> ProcessPoolExecutor:
+    """The process the projections are built in, started the first time one is.
+
+    One worker: the host has one core, and a second builder would only take turns
+    with the first while both take the core away from the requests. Started rather
+    than forked, because forking a process that already has threads is a way to
+    inherit a lock nobody will ever release.
+    """
+
+    global _builder
+    if _builder is None:
+        _builder = ProcessPoolExecutor(
+            max_workers=1,
+            initializer=_stand_aside,
+            mp_context=multiprocessing.get_context("spawn"),
+        )
+        overview_cache.build_elsewhere(_builder)
+        detail_cache.build_elsewhere(_builder)
+    return _builder
+
+
 async def refresher() -> None:
     """Rebuild what is being looked at, off the request path.
 
-    One projection per tick and in a worker thread: the host has a single core, and
-    rebuilding everything that has come due in one go stalls every request for the
-    sum of them. Spread out, the longest a request can wait behind the refresher is
-    one projection, and the ones that come due most often are the cheap ones.
+    One projection per tick, most overdue first, and built in another process:
+    rebuilding everything that has come due in one go stalled every request for the
+    sum of them, and doing it in this process stalled them for the length of the
+    build whatever the order. Spread out and moved aside, a rebuild costs a viewer
+    the core it shares, not the interpreter it no longer shares.
     """
 
     while True:
+        await asyncio.sleep(REFRESH_INTERVAL_SECONDS)
         for cache in (overview_cache, detail_cache):
             for key in cache.refresh_due()[:1]:
+                _builder_pool()
                 # A key that cannot be built must not end the loop.
                 with contextlib.suppress(Exception):
                     started = time.monotonic()
                     await asyncio.to_thread(cache.rebuild, key)
-                    log.info(
-                        "rebuilt %s in %.2fs", key, time.monotonic() - started
-                    )
-        await asyncio.sleep(REFRESH_INTERVAL_SECONDS)
+                    log.info("rebuilt %s in %.2fs", key, time.monotonic() - started)
 
 
 async def watchdog() -> None:
@@ -146,6 +179,8 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         for task in tasks:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+        if _builder is not None:
+            _builder.shutdown(cancel_futures=True)
 
 
 app = FastAPI(title="Explee Spend Observability", version=__version__, lifespan=lifespan)

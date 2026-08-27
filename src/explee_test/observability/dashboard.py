@@ -261,6 +261,114 @@ def _sparkline(points: list[tuple[str, float]], width: int = 48) -> list[float]:
     return [round(value, 4) for _, value in points[::stride]][-width:]
 
 
+# `_category` as SQL, so a window's attempts can be counted where they live instead
+# of being carried into this process one row at a time. The order of the branches is
+# the order of the Python function and has to stay that way: a throttled response is
+# a stated delay first and a 429 second.
+CATEGORY_SQL = """
+    CASE
+        WHEN p.outcome = 'success' THEN 'success'
+        WHEN p.outcome = 'throttled' OR p.error_code = 'http_429' THEN 'rate_limited'
+        WHEN p.error_code LIKE 'http_5%' THEN 'http_5xx'
+        WHEN p.outcome = 'http_error' THEN 'http_other'
+        WHEN p.outcome = 'transport_error' THEN 'transport'
+        WHEN p.outcome IN ('empty_payload', 'invalid_json') THEN 'payload'
+        ELSE 'normalization'
+    END
+"""
+
+# The rank of the sample that `_percentile` would pick, expressed for SQLite:
+# ceil(q * n) clamped into [1, n], which is the 1-based form of its index.
+def _percentile_rank_sql(quantile: float) -> str:
+    return (
+        f"min(n, max(1, CAST({quantile} * n AS INTEGER) "
+        f"+ (CASE WHEN {quantile} * n > CAST({quantile} * n AS INTEGER) THEN 1 ELSE 0 END)))"
+    )
+
+
+def _rounded(rows) -> dict[int, float]:
+    return {bucket: round(value, 1) for bucket, value in rows}
+
+
+def _load_window_attempts(connection: sqlite3.Connection, cutoff: str, until: str) -> None:
+    """Materialise the window's attempts once, then answer every count from it.
+
+    Every summary the page shows about collection is a count, a share or a
+    percentile over the same set of rows. Fetching that set into Python and looping
+    over it cost seconds on a week-long window; the set is built here as temporary
+    tables so the aggregates below read it in SQLite and hand back tens of rows.
+    """
+
+    connection.executescript(
+        """
+        DROP VIEW IF EXISTS temp.counted;
+        DROP TABLE IF EXISTS temp.cyc;
+        DROP TABLE IF EXISTS temp.dominant;
+        DROP TABLE IF EXISTS temp.att;
+        """
+    )
+    # `covered` travels with every attempt: whether the cycle it belongs to delivered
+    # data in the end. It is what tells a throttled attempt that a retry rescued from
+    # one that lost the poll, and computing it here saves a second pass over the rows.
+    connection.execute(
+        f"""
+        CREATE TEMP TABLE att AS
+        SELECT provider, cycle_id, at, latency_ms, outcome, category,
+               max(outcome = 'success') OVER (PARTITION BY provider, cycle_id) AS covered
+        FROM (
+            SELECT r.provider AS provider, r.cycle_id AS cycle_id, r.requested_at AS at,
+                   r.latency_ms AS latency_ms, p.outcome AS outcome,
+                   {CATEGORY_SQL} AS category
+            FROM raw_responses AS r
+            JOIN processing_results AS p ON p.raw_response_id = r.id
+            WHERE r.requested_at >= ? AND r.requested_at <= ?
+        )
+        """,
+        (cutoff, until),
+    )
+    # A throttled attempt that a retry rescued is not a collection failure, so every
+    # count of collection quality reads this view rather than the table.
+    connection.execute(
+        "CREATE TEMP VIEW counted AS "
+        "SELECT * FROM att WHERE NOT (outcome = 'throttled' AND covered = 1)"
+    )
+    # What mostly went wrong in a cycle, for the cycles where something did.
+    connection.execute(
+        """
+        CREATE TEMP TABLE dominant AS
+        SELECT provider, cycle_id, category FROM (
+            SELECT provider, cycle_id, category,
+                   row_number() OVER (
+                       PARTITION BY provider, cycle_id ORDER BY count(*) DESC
+                   ) AS rank
+            FROM att
+            WHERE outcome <> 'success'
+            GROUP BY provider, cycle_id, category
+        )
+        WHERE rank = 1
+        """
+    )
+    connection.execute("CREATE INDEX temp.dominant_cycle ON dominant(provider, cycle_id)")
+    # One row per polling cycle: did this poll deliver data at all, and if not, what
+    # mostly went wrong. A cycle whose retry succeeded delivered its data.
+    connection.execute(
+        """
+        CREATE TEMP TABLE cyc AS
+        SELECT grouped.provider AS provider, grouped.cycle_id AS cycle_id,
+               grouped.at AS at, grouped.covered AS covered,
+               dominant.category AS dominant
+        FROM (
+            SELECT provider, cycle_id, min(at) AS at, max(covered) AS covered
+            FROM att GROUP BY provider, cycle_id
+        ) AS grouped
+        LEFT JOIN dominant
+            ON dominant.provider = grouped.provider
+           AND dominant.cycle_id = grouped.cycle_id
+        """
+    )
+    connection.execute("CREATE INDEX temp.cyc_provider ON cyc(provider, at)")
+
+
 def _cycle_outcomes(rows: list[sqlite3.Row]) -> list[tuple[str, str, str | None]]:
     """Collapse a provider's attempts into one entry per polling cycle.
 
@@ -338,17 +446,116 @@ def build_overview(
     now = (now or datetime.now(UTC)).astimezone(UTC)
     cutoff, until, span_hours = _window(hours, now, start, end)
     with _connect(path) as connection:
-        attempts = connection.execute(
+        bucket_seconds = 60 if span_hours <= 2 else 300 if span_hours <= 24 else 3600
+        bucket_sql = (
+            f"CAST(strftime('%s', at) AS INTEGER) / {bucket_seconds} * {bucket_seconds}"
+        )
+        _load_window_attempts(connection, cutoff, until)
+        provider_totals = {
+            row["provider"]: row
+            for row in connection.execute(
+                """
+                SELECT provider, count(*) AS attempts,
+                       sum(outcome = 'success') AS successes
+                FROM att GROUP BY provider
+                """
+            )
+        }
+        cycle_totals = {
+            row["provider"]: row
+            for row in connection.execute(
+                "SELECT provider, count(*) AS cycles, sum(covered) AS covered "
+                "FROM cyc GROUP BY provider"
+            )
+        }
+        # Cycles since this provider last delivered anything. An empty string sorts
+        # before every timestamp, so a provider that never succeeded counts them all.
+        missing_cycles = dict(
+            connection.execute(
+                """
+                SELECT provider, count(*) FROM cyc AS c
+                WHERE c.at > coalesce(
+                    (SELECT max(at) FROM cyc AS s
+                     WHERE s.provider = c.provider AND s.covered = 1),
+                    ''
+                )
+                GROUP BY provider
+                """
+            )
+        )
+        outcome_counts: dict[str, dict[str, int]] = defaultdict(dict)
+        for provider, category, count in connection.execute(
+            "SELECT provider, category, count(*) FROM counted GROUP BY provider, category"
+        ):
+            outcome_counts[provider][category] = count
+        throttled_recovered = dict(
+            connection.execute(
+                """
+                SELECT att.provider, count(*)
+                FROM att
+                JOIN cyc ON cyc.provider = att.provider AND cyc.cycle_id = att.cycle_id
+                WHERE att.outcome = 'throttled' AND cyc.covered = 1
+                GROUP BY att.provider
+                """
+            )
+        )
+        # Only the cycles that delivered nothing come out, each carrying its position
+        # among the cycles an outage can be built from. Consecutive positions are one
+        # outage, so the successful cycles between them never have to be carried.
+        outage_rows = connection.execute(
             """
-            SELECT r.provider, r.requested_at, r.latency_ms, r.status_code,
-                   r.cycle_id, p.outcome, p.error_code
-            FROM processing_results AS p
-            JOIN raw_responses AS r ON r.id = p.raw_response_id
-            WHERE r.requested_at >= ? AND r.requested_at <= ?
-            ORDER BY r.requested_at
-            """,
-            (cutoff, until),
+            WITH kept AS (
+                SELECT provider, at, covered, dominant,
+                       row_number() OVER (PARTITION BY provider ORDER BY at) AS seq
+                FROM cyc
+                WHERE dominant IS NULL OR dominant <> 'rate_limited'
+            )
+            SELECT provider, at, dominant, seq FROM kept
+            WHERE covered = 0
+            ORDER BY provider, at
+            """
         ).fetchall()
+        bucket_rows = connection.execute(
+            f"SELECT {bucket_sql} AS bucket, category, count(*) "
+            "FROM counted GROUP BY bucket, category"
+        ).fetchall()
+        # Rounded here rather than in SQL: SQLite rounds a half away from zero and
+        # Python rounds it to even, and the two must not disagree on a tenth.
+        bucket_p95 = _rounded(
+            connection.execute(
+                f"""
+                WITH bucketed AS (
+                    SELECT {bucket_sql} AS bucket, latency_ms
+                    FROM counted WHERE latency_ms IS NOT NULL
+                ),
+                ranked AS (
+                    SELECT bucket, latency_ms,
+                           row_number() OVER (PARTITION BY bucket ORDER BY latency_ms) AS rn,
+                           count(*) OVER (PARTITION BY bucket) AS n
+                    FROM bucketed
+                )
+                SELECT bucket, latency_ms FROM ranked
+                WHERE rn = {_percentile_rank_sql(0.95)}
+                """
+            )
+        )
+        window_p95 = connection.execute(
+            f"""
+            WITH ranked AS (
+                SELECT latency_ms,
+                       row_number() OVER (ORDER BY latency_ms) AS rn,
+                       count(*) OVER () AS n
+                FROM counted WHERE latency_ms IS NOT NULL
+            )
+            SELECT latency_ms FROM ranked WHERE rn = {_percentile_rank_sql(0.95)}
+            """
+        ).fetchone()
+        total, valid = connection.execute(
+            "SELECT count(*), coalesce(sum(outcome = 'success'), 0) FROM counted"
+        ).fetchone()
+        window_attempts, first_at, last_at = connection.execute(
+            "SELECT count(*), min(at), max(at) FROM att"
+        ).fetchone()
         # Asked per provider over an index-ordered tail. Written as one ranked
         # scan of the whole table, this cost grew with every poll ever captured and
         # ignored the selected range entirely, which is what made the page slower
@@ -369,10 +576,12 @@ def build_overview(
                 (provider,),
             )
         ]
+        # Only the columns the plotted series is made of. Asking for the whole row
+        # sent the reader back to the table for every sample; these five live in the
+        # index the range is scanned on.
         observation_rows = connection.execute(
             """
-            SELECT provider, observed_at, metric_name, value, capacity, unit,
-                   refresh_at, labels_json, raw_response_id
+            SELECT provider, observed_at, value, raw_response_id, labels_json
             FROM observations
             WHERE observed_at >= ? AND observed_at <= ?
             ORDER BY observed_at
@@ -428,23 +637,18 @@ def build_overview(
             )
         ]
 
-    attempts_by_provider: dict[str, list[sqlite3.Row]] = defaultdict(list)
-    for row in attempts:
-        attempts_by_provider[row["provider"]].append(row)
-    # A cycle is what the reader cares about: did this poll produce data at all?
-    # A throttled attempt followed by a successful retry in the same cycle is not a
-    # collection failure, so it must not be counted or drawn as one.
-    cycles: dict[str, set[str]] = defaultdict(set)
-    covered: set[tuple[str, str]] = set()
-    for row in attempts:
-        cycles[row["provider"]].add(row["cycle_id"])
-        if row["outcome"] == "success":
-            covered.add((row["provider"], row["cycle_id"]))
+    # The failed cycles arrive without the successful ones between them, so a break
+    # in their numbering is a recovery; `detect_outages` reads a run of failures the
+    # same way whether the success that ended it is spelled out or implied.
+    outage_cycles: dict[str, list[tuple[str, str, str | None]]] = defaultdict(list)
+    previous: dict[str, int] = {}
+    for row in outage_rows:
+        provider = row["provider"]
+        if provider in previous and row["seq"] != previous[provider] + 1:
+            outage_cycles[provider].append((row["at"], "success", None))
+        outage_cycles[provider].append((row["at"], "no_data", row["dominant"]))
+        previous[provider] = row["seq"]
 
-    def recovered(row: sqlite3.Row) -> bool:
-        return (
-            row["outcome"] == "throttled" and (row["provider"], row["cycle_id"]) in covered
-        )
     history: dict[str, list[sqlite3.Row]] = defaultdict(list)
     for row in observation_rows:
         definition = PROVIDERS[row["provider"]]
@@ -484,22 +688,11 @@ def build_overview(
     providers = []
     events = []
     for provider, definition in PROVIDERS.items():
-        provider_attempts = attempts_by_provider[provider]
-        successes = sum(row["outcome"] == "success" for row in provider_attempts)
-        provider_cycles = cycles[provider]
-        covered_cycles = {cycle for name, cycle in covered if name == provider}
-        # Consecutive most recent cycles that produced nothing: the quantity an
-        # alert should reason about, because it counts polls rather than requests.
-        missing_cycles = 0
-        for _, outcome, _ in reversed(_cycle_outcomes(provider_attempts)):
-            if outcome == "success":
-                break
-            missing_cycles += 1
-        counts: dict[str, int] = defaultdict(int)
-        for row in provider_attempts:
-            if recovered(row):
-                continue
-            counts[_category(row["outcome"], row["error_code"])] += 1
+        totals = provider_totals.get(provider)
+        provider_attempts = totals["attempts"] if totals else 0
+        successes = totals["successes"] if totals else 0
+        provider_cycles = cycle_totals.get(provider)
+        counts = outcome_counts.get(provider, {})
         latest = latest_observation.get(provider)
         points = [(row["observed_at"], row["value"]) for row in history[provider]]
         traced = [
@@ -533,7 +726,7 @@ def build_overview(
                 latest["capacity"] if latest else None,
             )
         )
-        events.extend(detect_outages(provider, _cycle_outcomes(provider_attempts)))
+        events.extend(detect_outages(provider, outage_cycles[provider]))
         freshness = (
             (now - _parse_time(latest["observed_at"])).total_seconds() if latest else None
         )
@@ -571,18 +764,18 @@ def build_overview(
                 "window_net": (
                     round(points[-1][1] - points[0][1], 4) if len(points) > 1 else None
                 ),
-                "attempts": len(provider_attempts),
-                "valid_percent": round(100 * successes / len(provider_attempts), 1)
+                "attempts": provider_attempts,
+                "valid_percent": round(100 * successes / provider_attempts, 1)
                 if provider_attempts
                 else None,
                 "data_percent": round(
-                    100 * len(covered_cycles) / len(provider_cycles), 1
+                    100 * provider_cycles["covered"] / provider_cycles["cycles"], 1
                 )
                 if provider_cycles
                 else None,
-                "cycles": len(provider_cycles),
-                "missing_cycles": missing_cycles,
-                "throttled_recovered": sum(recovered(row) for row in provider_attempts),
+                "cycles": provider_cycles["cycles"] if provider_cycles else 0,
+                "missing_cycles": missing_cycles.get(provider, 0),
+                "throttled_recovered": throttled_recovered.get(provider, 0),
                 "outcomes": dict(counts),
                 "last_attempt": dict(latest_attempt[provider])
                 if provider in latest_attempt
@@ -591,36 +784,22 @@ def build_overview(
             }
         )
 
-    bucket_seconds = 60 if span_hours <= 2 else 300 if span_hours <= 24 else 3600
-    buckets: dict[int, dict[str, int]] = defaultdict(lambda: defaultdict(int))
-    bucket_latencies: dict[int, list[float]] = defaultdict(list)
-    latencies = []
-    for row in attempts:
-        if recovered(row):
-            continue
-        timestamp = int(_parse_time(row["requested_at"]).timestamp())
-        bucket = timestamp - timestamp % bucket_seconds
-        category = _category(row["outcome"], row["error_code"])
-        buckets[bucket][category] += 1
-        if row["latency_ms"] is not None:
-            latencies.append(row["latency_ms"])
-            bucket_latencies[bucket].append(row["latency_ms"])
+    buckets: dict[int, dict[str, int]] = defaultdict(dict)
+    for timestamp, category, count in bucket_rows:
+        buckets[timestamp][category] = count
     quality_series = []
     for timestamp, counts in sorted(buckets.items()):
-        total = sum(counts.values())
+        bucket_total = sum(counts.values())
         quality_series.append(
             {
                 "at": datetime.fromtimestamp(timestamp, UTC).isoformat(),
-                "total": total,
-                "valid_percent": round(100 * counts.get("success", 0) / total, 1),
-                "p95_latency_ms": _percentile(bucket_latencies[timestamp], 0.95),
+                "total": bucket_total,
+                "valid_percent": round(100 * counts.get("success", 0) / bucket_total, 1),
+                "p95_latency_ms": bucket_p95.get(timestamp),
                 **counts,
             }
         )
 
-    counted = [row for row in attempts if not recovered(row)]
-    total = len(counted)
-    valid = sum(row["outcome"] == "success" for row in counted)
     # Only USD-denominated outflow can be summed honestly; credits have no price
     # here and the single GBP balance is not converted without a rate we can cite.
     comparable = [
@@ -639,9 +818,9 @@ def build_overview(
         item["provider"] for item in providers if (item["forecast"] or {}).get("kind") == "in_debt"
     ]
     covered_hours = 0.0
-    if attempts:
+    if first_at and last_at:
         covered_hours = (
-            _parse_time(attempts[-1]["requested_at"]) - _parse_time(attempts[0]["requested_at"])
+            _parse_time(last_at) - _parse_time(first_at)
         ).total_seconds() / 3600
     spent = sum(
         item["window_spend"]
@@ -677,9 +856,9 @@ def build_overview(
             "fresh": fresh,
             "degraded": degraded,
             "attempts": total,
-            "throttled_recovered": len(attempts) - total,
+            "throttled_recovered": window_attempts - total,
             "valid_percent": round(100 * valid / total, 1) if total else None,
-            "p95_latency_ms": _percentile(latencies, 0.95),
+            "p95_latency_ms": round(window_p95[0], 1) if window_p95 else None,
             "usd_burn_per_hour": round(burn, 4),
             "usd_projected_30d": round(burn * 24 * 30, 2),
             "usd_sources": len(comparable),

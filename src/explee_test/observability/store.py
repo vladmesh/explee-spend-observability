@@ -33,8 +33,11 @@ CREATE INDEX IF NOT EXISTS raw_responses_provider_time
 CREATE INDEX IF NOT EXISTS raw_responses_cycle ON raw_responses(cycle_id);
 -- The dashboard asks for a window across all providers, and the composite index
 -- above cannot serve a range on its second column, so every page view scanned the
--- whole capture. Time alone is what that question is keyed by.
-CREATE INDEX IF NOT EXISTS raw_responses_time ON raw_responses(requested_at);
+-- whole capture. Time alone is what that question is keyed by, and the columns it
+-- reads ride along: a captured body is large, and going back to the table for one
+-- turns a sequential read of a window into a random read of the whole capture.
+CREATE INDEX IF NOT EXISTS raw_responses_window
+    ON raw_responses(requested_at, provider, cycle_id, latency_ms, status_code);
 
 CREATE TABLE IF NOT EXISTS processing_results (
     raw_response_id INTEGER PRIMARY KEY,
@@ -73,7 +76,8 @@ CREATE INDEX IF NOT EXISTS observations_provider_time
     ON observations(provider, observed_at);
 CREATE INDEX IF NOT EXISTS observations_metric_time
     ON observations(metric_name, observed_at);
-CREATE INDEX IF NOT EXISTS observations_time ON observations(observed_at);
+CREATE INDEX IF NOT EXISTS observations_window
+    ON observations(observed_at, provider, value, raw_response_id, labels_json);
 
 CREATE TABLE IF NOT EXISTS alerts (
     id INTEGER PRIMARY KEY,
@@ -92,6 +96,10 @@ CREATE TABLE IF NOT EXISTS alerts (
 # the same script as the tables, because on such a database the column does not
 # exist yet when the script executes.
 POST_MIGRATION_SCHEMA = """
+-- Superseded by the covering indexes above; kept as an explicit drop so a database
+-- that already carries them does not keep paying for them on every insert.
+DROP INDEX IF EXISTS raw_responses_time;
+DROP INDEX IF EXISTS observations_time;
 CREATE UNIQUE INDEX IF NOT EXISTS alerts_open_key
     ON alerts(dedupe_key) WHERE resolved_at IS NULL;
 CREATE INDEX IF NOT EXISTS alerts_emitted ON alerts(emitted_at);

@@ -1,5 +1,7 @@
 import asyncio
 import contextlib
+import logging
+import sqlite3
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -112,7 +114,16 @@ async def watchdog() -> None:
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     database_path = get_settings().database_path
-    initialise_database(database_path)
+    # The read surface must come up even if the schema step cannot get the write
+    # lock: it reads, and the collector applies the same schema. Exiting here turned
+    # a busy database into a crash loop that only luck got the page out of.
+    try:
+        initialise_database(database_path)
+    except sqlite3.OperationalError:
+        logging.getLogger(__name__).warning(
+            "schema not applied at startup; serving reads and leaving it to the collector",
+            exc_info=True,
+        )
     overview_cache.keep_warm(
         tuple((str(database_path), hours, None, None) for hours in PRESET_HOURS)
     )

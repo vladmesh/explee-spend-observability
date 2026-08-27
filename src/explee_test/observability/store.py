@@ -181,11 +181,18 @@ def _migrate(connection: sqlite3.Connection) -> None:
     _drop_legacy_alert_uniqueness(connection)
 
 
+# The collector writes every thirty seconds and both processes apply this schema at
+# startup, so one of them will meet the other's write lock. Waiting for it is the
+# whole answer; the default five seconds is not enough while a poll cycle is being
+# written into a capture this size.
+SCHEMA_LOCK_TIMEOUT_SECONDS = 60.0
+
+
 def initialise_database(path: Path) -> None:
     """Create the durable store without requiring an external service."""
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(path) as connection:
+    with sqlite3.connect(path, timeout=SCHEMA_LOCK_TIMEOUT_SECONDS) as connection:
         connection.executescript(SCHEMA)
         _migrate(connection)
         connection.executescript(POST_MIGRATION_SCHEMA)

@@ -53,6 +53,11 @@ RATE_WINDOW_POINTS = 121
 # The rate is a speedometer: it always reads the most recent samples, whatever range
 # the reader has selected. Two hours is comfortably more than RATE_WINDOW_POINTS polls.
 RATE_LOOKBACK_HOURS = 2.0
+# Tails read per provider instead of scanning the whole capture. Both are far longer
+# than the handful of rows the answer actually needs, and both are bounded, which is
+# the point: the cost of a page view must not grow with how long the collector ran.
+LATEST_OBSERVATION_TAIL = 60
+STREAK_TAIL = 1000
 
 
 def _despike(points: list[tuple[str, float]]) -> list[tuple[str, float]]:
@@ -344,18 +349,26 @@ def build_overview(
             """,
             (cutoff, until),
         ).fetchall()
-        latest_attempt_rows = connection.execute(
-            """
-            WITH ranked AS (
+        # Asked per provider over an index-ordered tail. Written as one ranked
+        # scan of the whole table, this cost grew with every poll ever captured and
+        # ignored the selected range entirely, which is what made the page slower
+        # every day it ran.
+        latest_attempt_rows = [
+            row
+            for provider in PROVIDERS
+            for row in connection.execute(
+                """
                 SELECT r.provider, r.requested_at, r.latency_ms, r.status_code,
-                       p.outcome, p.error_code,
-                       row_number() OVER (PARTITION BY r.provider ORDER BY r.id DESC) AS rank
-                FROM processing_results AS p
-                JOIN raw_responses AS r ON r.id = p.raw_response_id
+                       p.outcome, p.error_code
+                FROM raw_responses AS r
+                JOIN processing_results AS p ON p.raw_response_id = r.id
+                WHERE r.provider = ?
+                ORDER BY r.requested_at DESC, r.id DESC
+                LIMIT 1
+                """,
+                (provider,),
             )
-            SELECT * FROM ranked WHERE rank = 1
-            """
-        ).fetchall()
+        ]
         observation_rows = connection.execute(
             """
             SELECT provider, observed_at, metric_name, value, capacity, unit,
@@ -366,17 +379,24 @@ def build_overview(
             """,
             (cutoff, until),
         ).fetchall()
-        latest_observation_rows = connection.execute(
-            """
-            WITH ranked AS (
-                SELECT *, row_number() OVER (
-                    PARTITION BY provider, metric_name, labels_json ORDER BY id DESC
-                ) AS rank
+        # A provider writes at most a couple of series per poll, so its newest
+        # sample of each is inside a short tail; the ordering matches the
+        # (provider, observed_at) index, so this reads a handful of rows.
+        latest_observation_rows = [
+            row
+            for provider in PROVIDERS
+            for row in connection.execute(
+                """
+                SELECT provider, observed_at, metric_name, value, capacity, unit,
+                       refresh_at, labels_json, raw_response_id
                 FROM observations
+                WHERE provider = ?
+                ORDER BY observed_at DESC, id DESC
+                LIMIT ?
+                """,
+                (provider, LATEST_OBSERVATION_TAIL),
             )
-            SELECT * FROM ranked WHERE rank = 1
-            """
-        ).fetchall()
+        ]
         # Rates, forecasts and the burn headline answer "right now", so they read the
         # latest samples regardless of the selected range; a click that narrows the
         # window to five minutes must not turn them into five minutes of noise.
@@ -389,14 +409,24 @@ def build_overview(
             """,
             ((now - timedelta(hours=RATE_LOOKBACK_HOURS)).isoformat(), now.isoformat()),
         ).fetchall()
-        streak_rows = connection.execute(
-            """
-            SELECT r.provider, r.requested_at, p.outcome
-            FROM processing_results AS p
-            JOIN raw_responses AS r ON r.id = p.raw_response_id
-            ORDER BY r.provider, r.id DESC
-            """
-        ).fetchall()
+        # Only the run of failures at the end of each provider's history matters,
+        # and the whole history was being sorted to find it. A tail of this length
+        # is several hours of polling; a streak that outlives it reads as its length.
+        streak_rows = [
+            row
+            for provider in PROVIDERS
+            for row in connection.execute(
+                """
+                SELECT r.provider, r.requested_at, p.outcome
+                FROM raw_responses AS r
+                JOIN processing_results AS p ON p.raw_response_id = r.id
+                WHERE r.provider = ?
+                ORDER BY r.requested_at DESC, r.id DESC
+                LIMIT ?
+                """,
+                (provider, STREAK_TAIL),
+            )
+        ]
 
     attempts_by_provider: dict[str, list[sqlite3.Row]] = defaultdict(list)
     for row in attempts:
@@ -425,11 +455,13 @@ def build_overview(
         if _is_primary(PROVIDERS[row["provider"]], row["labels_json"]):
             recent[row["provider"]].append((row["observed_at"], row["value"]))
     latest_attempt = {row["provider"]: row for row in latest_attempt_rows}
+    # The tail arrives newest first, so the first primary row a provider offers is
+    # its current value and later rows are that provider's older samples.
     latest_observation = {}
     for row in latest_observation_rows:
         definition = PROVIDERS[row["provider"]]
         if _is_primary(definition, row["labels_json"]):
-            latest_observation[row["provider"]] = row
+            latest_observation.setdefault(row["provider"], row)
 
     streaks: dict[str, dict[str, Any]] = {}
     grouped_streaks: dict[str, list[sqlite3.Row]] = defaultdict(list)

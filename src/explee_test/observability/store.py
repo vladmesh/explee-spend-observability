@@ -31,6 +31,10 @@ CREATE TABLE IF NOT EXISTS raw_responses (
 CREATE INDEX IF NOT EXISTS raw_responses_provider_time
     ON raw_responses(provider, requested_at);
 CREATE INDEX IF NOT EXISTS raw_responses_cycle ON raw_responses(cycle_id);
+-- The dashboard asks for a window across all providers, and the composite index
+-- above cannot serve a range on its second column, so every page view scanned the
+-- whole capture. Time alone is what that question is keyed by.
+CREATE INDEX IF NOT EXISTS raw_responses_time ON raw_responses(requested_at);
 
 CREATE TABLE IF NOT EXISTS processing_results (
     raw_response_id INTEGER PRIMARY KEY,
@@ -69,6 +73,7 @@ CREATE INDEX IF NOT EXISTS observations_provider_time
     ON observations(provider, observed_at);
 CREATE INDEX IF NOT EXISTS observations_metric_time
     ON observations(metric_name, observed_at);
+CREATE INDEX IF NOT EXISTS observations_time ON observations(observed_at);
 
 CREATE TABLE IF NOT EXISTS alerts (
     id INTEGER PRIMARY KEY,

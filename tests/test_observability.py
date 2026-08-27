@@ -118,7 +118,11 @@ def test_normalization_outcomes_and_dashboard_projection(tmp_path) -> None:
     assert openai["last_attempt"]["outcome"] == "http_error"
     assert openai["failure_streak"]["count"] == 2
 
-    detail = build_provider_detail(path, "openai", 24)
+    # The fixture lives on a fixed date, so the window has to be stated; a relative
+    # one silently empties as soon as the test is run on a later day.
+    detail = build_provider_detail(
+        path, "openai", 24, start=at, end="2026-08-23T00:02:00+00:00"
+    )
     assert detail["latest_raw"]["raw_response_id"] == 1
     assert detail["series"][0]["points"] == [[at, 10.0, 1]]
 

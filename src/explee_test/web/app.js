@@ -667,8 +667,8 @@ function selectTab(tab) {
   if (tab === "attempts") outcomeChart?.resize();
 }
 
-async function showProvider(provider) {
-  const response = await fetch(`/api/providers/${provider}?${windowQuery()}`);
+async function showProvider(provider, signal) {
+  const response = await fetch(`/api/providers/${provider}?${windowQuery()}`, { signal });
   if (!response.ok) return;
   const data = await response.json();
   $("#detail").hidden = false;
@@ -700,15 +700,31 @@ function renderAll() {
   $("#updated").textContent = `Updated ${new Date(overview.generated_at).toLocaleTimeString()}`;
 }
 
+/* Every request carries the number it was issued with, and only the newest one is
+   allowed to paint. Without this a slow answer for the previous window arrives after
+   the new one and overwrites it, which reads exactly like the range selector doing
+   nothing. Requests that have been superseded are aborted rather than left running. */
+let loadSequence = 0;
+let inFlight = null;
+
 async function load() {
+  const sequence = ++loadSequence;
+  inFlight?.abort();
+  const controller = new AbortController();
+  inFlight = controller;
   try {
-    const response = await fetch(`/api/overview?${windowQuery()}`);
+    const response = await fetch(`/api/overview?${windowQuery()}`, { signal: controller.signal });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    overview = await response.json();
+    const payload = await response.json();
+    if (sequence !== loadSequence) return;
+    overview = payload;
     renderAll();
-    if (state.provider) await showProvider(state.provider);
+    if (state.provider) await showProvider(state.provider, controller.signal);
   } catch (error) {
+    if (error.name === "AbortError" || sequence !== loadSequence) return;
     $("#answer").innerHTML = `<div class="error-state">Dashboard data unavailable: ${escapeText(error.message)}</div>`;
+  } finally {
+    if (inFlight === controller) inFlight = null;
   }
 }
 
@@ -782,7 +798,10 @@ const waitForCharts = setInterval(() => {
   if (window.echarts) {
     clearInterval(waitForCharts);
     load();
-    setInterval(() => { if (!state.start) load(); }, 30_000);
+    // A refresh only makes sense when the previous one has landed; on a large
+    // capture the answer can take longer than the interval, and stacking requests
+    // starves the single-CPU host that also runs the collector.
+    setInterval(() => { if (!state.start && !inFlight) load(); }, 30_000);
   } else if ((waited += 50) > 8000) {
     clearInterval(waitForCharts);
     $("#answer").innerHTML = '<div class="error-state">Chart library did not load. Tables and events still work after a reload.</div>';

@@ -29,6 +29,15 @@ def test_an_expensive_projection_is_refreshed_less_often() -> None:
     assert cache.refresh_due() == []
 
 
+def test_an_expensive_answer_is_served_for_as_long_as_it_is_refreshed() -> None:
+    # A fixed staleness shorter than the refresh interval would rebuild the costly
+    # projections on the request path, which is what the cache exists to prevent.
+    cache, builds = _counting_cache(minimum_age=600.0)
+    cache.get((1,))
+    cache.get((1,))
+    assert builds == [1]
+
+
 def test_what_nobody_looks_at_stops_being_refreshed() -> None:
     cache, _ = _counting_cache(minimum_age=0.0, refresh_factor=0.0, demand_seconds=0.0)
     cache.get((1,))
@@ -40,7 +49,7 @@ def test_what_nobody_looks_at_stops_being_refreshed() -> None:
 
 
 def test_a_stale_answer_is_not_served() -> None:
-    cache, builds = _counting_cache(stale_after=0.0)
+    cache, builds = _counting_cache(stale_factor=0.0, stale_floor=0.0)
     cache.get((1,))
     assert cache.get((1,)) == "built 1 #2"
     assert builds == [1, 1]

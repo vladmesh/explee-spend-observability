@@ -26,14 +26,18 @@ from typing import Any
 # The collector writes every thirty seconds, so nothing is gained by rebuilding
 # faster than that.
 MINIMUM_AGE_SECONDS = 30.0
-# An answer that takes a second may be rebuilt every twenty; one that takes six may
-# not. The host has one core, so a rebuild is time no request can be served in, and
-# the wider the window the less a poll cycle changes it: a week moves by 0.3% while
-# the projection of it is two minutes old, which is not worth stalling viewers for.
-REFRESH_FACTOR = 20.0
-# Past this age a cached answer is no longer served: the caller waits for a fresh
-# one. This is what a viewer sees if the refresher is not running at all.
-STALE_AFTER_SECONDS = 120.0
+# An answer that takes a second may be rebuilt every eight; one that takes twenty
+# may not. The host has one core, and the wider the window the less a poll cycle
+# changes it: a week moves by 0.03% while the projection of it rebuilds.
+REFRESH_FACTOR = 8.0
+# Past this much of its own refresh interval, a cached answer is no longer served
+# and the caller waits for a fresh one. It is a multiple of the interval rather
+# than a fixed age because a fixed age shorter than the interval means the
+# expensive projections -- the only ones worth caching -- are rebuilt on the
+# request path anyway, which is the whole thing this exists to avoid. It is what a
+# viewer waits for only if the refresher has stopped running.
+STALE_FACTOR = 3.0
+STALE_FLOOR_SECONDS = 120.0
 # How long a window nobody asked for keeps being refreshed after the last request.
 DEMAND_SECONDS = 600.0
 
@@ -57,7 +61,8 @@ class ProjectionCache:
         warm: tuple[tuple, ...] = (),
         minimum_age: float = MINIMUM_AGE_SECONDS,
         refresh_factor: float = REFRESH_FACTOR,
-        stale_after: float = STALE_AFTER_SECONDS,
+        stale_factor: float = STALE_FACTOR,
+        stale_floor: float = STALE_FLOOR_SECONDS,
         demand_seconds: float = DEMAND_SECONDS,
     ) -> None:
         self._build = build
@@ -65,7 +70,8 @@ class ProjectionCache:
         self._warm = set(warm)
         self._minimum_age = minimum_age
         self._refresh_factor = refresh_factor
-        self._stale_after = stale_after
+        self._stale_factor = stale_factor
+        self._stale_floor = stale_floor
         self._demand_seconds = demand_seconds
         self._entries: dict[Hashable, _Entry] = {}
         self._guard = threading.Lock()
@@ -96,14 +102,16 @@ class ProjectionCache:
             entry = self._entries.get(key)
             if entry is not None:
                 entry.requested_at = now
-                if now - entry.built_at < self._stale_after:
+                if now - entry.built_at < self._stale_after(entry):
                     return entry.payload
             lock = self._building.setdefault(key, threading.Lock())
         with lock:
             # Another caller may have finished the build while this one waited.
             with self._guard:
                 entry = self._entries.get(key)
-                if entry is not None and time.monotonic() - entry.built_at < self._stale_after:
+                if entry is not None and (
+                    time.monotonic() - entry.built_at < self._stale_after(entry)
+                ):
                     return entry.payload
             # A caller is already waiting on this one, so it is built here: handing
             # it to the builder would only add the trip there and back.
@@ -129,8 +137,7 @@ class ProjectionCache:
                     del self._entries[key]
                     self._building.pop(key, None)
                     continue
-                interval = max(self._minimum_age, self._refresh_factor * entry.build_seconds)
-                overdue = (now - entry.built_at) / interval
+                overdue = (now - entry.built_at) / self._interval(entry)
                 if overdue >= 1.0:
                     due.append((overdue, key))
             missing = [key for key in self._warm if key not in self._entries]
@@ -144,6 +151,12 @@ class ProjectionCache:
             lock = self._building.setdefault(key, threading.Lock())
         with lock:
             self._rebuild(key, elsewhere=True)
+
+    def _interval(self, entry: _Entry) -> float:
+        return max(self._minimum_age, self._refresh_factor * entry.build_seconds)
+
+    def _stale_after(self, entry: _Entry) -> float:
+        return max(self._stale_floor, self._stale_factor * self._interval(entry))
 
     def _rebuild(self, key: tuple, *, elsewhere: bool) -> Any:
         started = time.monotonic()

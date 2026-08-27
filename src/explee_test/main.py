@@ -46,6 +46,9 @@ IMMUTABLE_PREFIX = "/static/vendor/"
 # heuristic freshness and can keep running a previous deployment's JavaScript for
 # hours; "no-cache" still allows a 304, so revalidation stays cheap.
 REVALIDATE = "no-cache"
+# The server configures its own logging and leaves the root logger without a
+# handler, so anything this module has to say goes through the server's logger.
+log = logging.getLogger("uvicorn.error")
 WATCHDOG_INTERVAL_SECONDS = 30.0
 REFRESH_INTERVAL_SECONDS = 5.0
 # The windows the page offers. They are kept built, because the first viewer of a
@@ -87,7 +90,7 @@ async def refresher() -> None:
                 with contextlib.suppress(Exception):
                     started = time.monotonic()
                     await asyncio.to_thread(cache.rebuild, key)
-                    logging.getLogger(__name__).info(
+                    log.info(
                         "rebuilt %s in %.2fs", key, time.monotonic() - started
                     )
         await asyncio.sleep(REFRESH_INTERVAL_SECONDS)
@@ -127,7 +130,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     try:
         initialise_database(database_path)
     except sqlite3.OperationalError:
-        logging.getLogger(__name__).warning(
+        log.warning(
             "schema not applied at startup; serving reads and leaving it to the collector",
             exc_info=True,
         )
